@@ -9,7 +9,7 @@ var S = {
   // mining
   mine: false, mineMaxTiles: 70, helpTiles: 70, mineMatch: true, mineCircle: true, mineOrbit: 3, mineIdx: 0,
   // building
-  rebuild: false, buildNav: true,
+  rebuild: false, buildNav: true, lifo: false,
   // unit
   heal: false, healAt: 35, goCore: false, camFollow: false, speedIdx: 0, wantUnit: "", manualOverride: false,
   // anti grief
@@ -220,7 +220,14 @@ function assistTick(u, core){
   }
 
   var now2 = Time.millis();
-  var plan = (tu.activelyBuilding() && !(ignoreUntil[p.id] > now2)) ? tu.buildPlan() : null;
+  var plan = null;
+  if(tu.activelyBuilding() && !(ignoreUntil[p.id] > now2)){
+    plan = tu.buildPlan();
+    // optional: help with the block they queued LAST instead of the one they are on
+    if(S.lifo && tu.plans.size > 1){
+      try{ plan = tu.plans.last(); }catch(err){}
+    }
+  }
   if(plan != null){
     lastBuildSeen = now2;
     // if they sit on the same block for 20s they cannot finish it (no resources, blocked...): give up on them for a while
@@ -951,6 +958,7 @@ S.markName = Core.settings.getBool("mt-mark", false);
 S.announce = Core.settings.getBool("mt-announce", true);
 S.barMin = Core.settings.getBool("mt-min", false);
 S.coords = Core.settings.getBool("mt-coords", true);
+S.lifo = Core.settings.getBool("mt-lifo", false);
 S.monitor = Core.settings.getBool("mt-mon", false);
 try{
   S.griefLevel = parseInt(String(Core.settings.getString("mt-gl", "1")));
@@ -1222,6 +1230,11 @@ Events.on(EventType.ClientLoadEvent, e => {
     });
     toggle(p, "Circle around the player", "circle");
     btn(p, "Not circling: stay " + S.escortDist + " tiles beside them (tap to change)", () => { S.escortDist = ESCORT[(ESCORT.indexOf(S.escortDist) + 1) % ESCORT.length]; refresh(); });
+    btn(p, "Which of their blocks first: " + (S.lifo ? "the last one they queued" : "the one they are on") + " (tap to change)", () => {
+      S.lifo = !S.lifo;
+      Core.settings.put("mt-lifo", S.lifo);
+      refresh();
+    });
     toggle(p, "Shoot where they shoot", "copyShoot");
     toggle(p, "Respawn at the core nearest them if they are very far", "farReset");
     toggle(p, "Don't help other Mobile Tools users (when helping anyone)", "skipModUsers");
