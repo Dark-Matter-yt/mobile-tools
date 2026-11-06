@@ -1,5 +1,3 @@
-# Mobile Tools
-
 ## 📱 About
 
 Mobile Tools focuses on making Mindustry more convenient to play on Android and other mobile devices.
@@ -43,7 +41,7 @@ We are still in beta so there might be bugs.
 
 ## 📌 Version
 
-Current version: **3.1.2**
+Current version: **3.1.6**
 
 More features and improvements may be added in future releases.
 
