@@ -1,6 +1,6 @@
 ## 📱 About
 
-Mobile Tools focuses on making Mindustry more convenient to play on Android and other mobile devices.
+Mobile Tools focuses on making Mindustry more convenient to play on mobile devices.
 
 The mod is lightweight and designed to work alongside the normal Mindustry experience.
 
@@ -10,7 +10,6 @@ The mod is lightweight and designed to work alongside the normal Mindustry exper
 * ⚙️ Lightweight JavaScript-based functionality
 * 🎮 Designed for Mindustry
 * 🔧 Easy to update and maintain
-* 🚀 Open-source project
 
 ## 📥 Installation
 
@@ -33,15 +32,12 @@ When a new version is available:
 
 ## ⚠️ Disclaimer
 
-Mobile Tools is a community-made project and is not affiliated with or officially supported by the Mindustry development team.
+Mobile Tools is a project and is not affiliated with or officially supported by the Mindustry development team.
 
-**Mindustry** is a game created by Anuken.
-
-We are still in beta so there might be bugs.
 
 ## 📌 Version
 
-Current version: **3.1.6**
+Current version: **3.1.7**
 
 More features and improvements may be added in future releases.
 
