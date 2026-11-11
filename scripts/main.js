@@ -1,6 +1,10 @@
 // Mobile Tools v3 - client-side helper mod for Mindustry (build 146+)
 // Quick bar on the HUD (drag it anywhere) + the full menu behind the "MT" button.
 
+// BUILD TYPE: true in the owner's copy, false in the copy you hand to other people.
+// Only the owner's copy can show the owner badge; the public copy has no way to turn it on.
+var OWNER_BUILD = false;
+
 var S = {
   // view
   turretRanges: false, enemyRanges: false, unitRanges: false, power: false,
@@ -17,10 +21,11 @@ var S = {
   // squad (your own units)
   squadMode: "follow", squadForm: "circle", squadSpacing: 3, squadDist: 5, squadRadius: 25, squadShoot: false, squadVia: "game", squadOrbitR: 8, squadOrbitSpeed: 60, squadOrbitDir: 1,
   // misc
-  chatSpots: true, markName: false, announce: true, barMin: false, monitor: false, coords: true, escortDist: 5, escortAngle: 150, tab: 0
+  owner: false, chatSpots: true, markName: false, announce: true, barMin: false, monitor: false, coords: true, escortDist: 5, escortAngle: 150, tab: 0
 };
 
 var MARK = "\u200b\u200c\u200b";      // optional invisible name tag
+var OWNER_MARK = "\u2060\u200b\u2060";   // added after the ping by the mod owner's copy
 var PING = "\u200b\u200d\u200c\u200d";   // invisible chat ping that other Mobile Tools users recognise      // invisible tag added to your name so other Mobile Tools users can see you
 var SPEEDS = [1, 1.5, 2, 3];
 var HEAL_AT = [25, 35, 50, 70];
@@ -48,7 +53,7 @@ var fr = 0, sqPhaseT = 0, assistSearchAt = 0, planAt = 0, planSize = -1, planNX 
 var healRP = null, healRPAt = 0, rebuildAt = 0, oreVerAt = 0, rangeAt = 0, rangeList = [], profNs = 0, profFrames = 0, profMs = 0;
 var chatSpots = [], lastTopLine = "", gotoPos = null, spotBtn = null, lastSpotTxt = "", spotAt = 0;
 var lastTexts = {}, textsSeen = 0, chatReadOk = null, pendingTexts = [];
-var respawnPos = null, modSeen = {}, lastPing = 0, pingDue = 0, detectAt = 0, infoCache = "", infoAt2 = 0, worldStart = Time.millis();
+var respawnPos = null, ownerSeen = {}, modSeen = {}, lastPing = 0, pingDue = 0, detectAt = 0, infoCache = "", infoAt2 = 0, worldStart = Time.millis();
 
 // Explicit wrappers: Mindustry's Rhino can't pick between overloads when given a bare function
 function mkCons(f){ return new Packages.arc.func.Cons({get: f}); }
@@ -667,7 +672,10 @@ function detectTick(){
     if(q == Vars.player) return;
     try{
       var lt = String(q.lastText);
-      if(lt.indexOf(PING) >= 0) modSeen[q.id] = true;
+      if(lt.indexOf(PING) >= 0){
+        modSeen[q.id] = true;
+        if(lt.indexOf(OWNER_MARK) >= 0) ownerSeen[q.id] = true; else delete ownerSeen[q.id];
+      }
       else if(lt.length > 0 && lastTexts[q.id] !== lt){
         var firstLook = lastTexts[q.id] === undefined; // the message that was already there when we joined
         lastTexts[q.id] = lt;
@@ -695,7 +703,7 @@ function detectTick(){
   if(S.announce && pingDue > 0 && now >= pingDue && Vars.net.active()){
     pingDue = 0;
     lastPing = now;
-    try{ Call.sendChatMessage(PING); }catch(err){}
+    try{ Call.sendChatMessage((S.owner && OWNER_BUILD) ? PING + OWNER_MARK : PING); }catch(err){}
   }
 }
 
@@ -1318,7 +1326,7 @@ Events.on(EventType.PlayerJoin, e => {
 Events.on(EventType.PlayerLeave, e => { toast(dname(e.player) + " left"); });
 Events.on(EventType.WorldLoadEvent, e => {
   healing = false; assistCopied = false; oreTile = null; matchTile = null; autoItem = null; curItemAt = 0; oreCache = {}; nearCache = {}; ourPlan = null;
-  undoStack = []; tally = {}; removed = []; flagged = {}; modSeen = {}; ignoreUntil = {};
+  undoStack = []; tally = {}; removed = []; flagged = {}; modSeen = {}; ownerSeen = {}; ignoreUntil = {};
   worldStart = Time.millis();
   if(S.announce) pingDue = Time.millis() + 6000;
   sqClear(); sqTapMode = null;
@@ -1395,6 +1403,7 @@ S.barMin = Core.settings.getBool("mt-min", false);
 S.coords = Core.settings.getBool("mt-coords", true);
 S.lifo = Core.settings.getBool("mt-lifo", false);
 S.chatSpots = Core.settings.getBool("mt-spots", true);
+S.owner = OWNER_BUILD && Core.settings.getBool("mt-owner", true);
 try{
   var sqSaved = JSON.parse(String(Core.settings.getString("mt-squad", "{}")));
   for(var sqk in sqSaved) if(sqk.indexOf("squad") == 0 && sqk != "squadMode") S[sqk] = sqSaved[sqk];
@@ -1674,7 +1683,7 @@ Events.on(EventType.ClientLoadEvent, e => {
       btn(p, "Anyone who is building", () => { S.targetId = -1; S.assist = true; picker.hide(); refresh(); });
       eachOf(Groups.player, q => {
         if(q == Vars.player || !sameTeam(q)) return;
-        btn(p, dname(q) + (isModUser(q) ? "  [lightgray](Mobile Tools)" : ""), () => { S.targetId = q.id; S.assist = true; picker.hide(); refresh(); });
+        btn(p, dname(q) + (ownerSeen[q.id] === true ? "  [gold](owner)" : (isModUser(q) ? "  [lightgray](Mobile Tools)" : "")), () => { S.targetId = q.id; S.assist = true; picker.hide(); refresh(); });
       });
     })).grow();
     picker.show();
@@ -1876,13 +1885,14 @@ Events.on(EventType.ClientLoadEvent, e => {
 
   function tabUsers(p){
     section(p, "Mobile Tools users", "Found automatically when they use the mod. If it misses someone, tap them to mark them yourself. Marked players are never auto-helped.");
+    p.add("[accent]You:[] " + dname(Vars.player) + (S.owner ? "  [gold](owner of Mobile Tools)" : "")).left().row();
     var any = false;
     eachOf(Groups.player, q => {
       if(q == Vars.player) return;
       any = true;
       var auto = modSeen[q.id] === true || String(q.name).indexOf(MARK) >= 0;
       var man = ignored[dname(q)] === true;
-      var state = auto ? "[green]Mobile Tools (found automatically)" : (man ? "[accent]marked by you" : "[lightgray]not detected");
+      var state = ownerSeen[q.id] === true ? "[gold]Owner of Mobile Tools" : auto ? "[green]Mobile Tools (found automatically)" : (man ? "[accent]marked by you" : "[lightgray]not detected");
       btn(p, dname(q) + "  " + state, () => {
         if(auto) return;
         if(man) delete ignored[dname(q)]; else ignored[dname(q)] = true;
@@ -1893,6 +1903,7 @@ Events.on(EventType.ClientLoadEvent, e => {
     if(!any) p.add("No other players here").left().row();
     section(p, "Detection", "Other Mobile Tools users spot you through an invisible chat message sent when you join. Players without the mod may see a blank chat line.");
     p.check("Announce myself to other Mobile Tools users", S.announce, mkBoolc(v => { S.announce = v; Core.settings.put("mt-announce", v); })).left().wrap().growX().row();
+    if(OWNER_BUILD) p.check("I own this mod (other Mobile Tools users see an owner badge next to my name)", S.owner, mkBoolc(v => { S.owner = v; Core.settings.put("mt-owner", v); pingDue = Time.millis() + 500; refresh(); })).left().wrap().growX().row();
     p.check("Also tag my name (applies when you rejoin)", S.markName, mkBoolc(v => { S.markName = v; Core.settings.put("mt-mark", v); applyNameMark(); })).left().wrap().growX().row();
   }
 
