@@ -14,8 +14,10 @@ var S = {
   heal: false, healAt: 35, goCore: false, camFollow: false, speedIdx: 0, wantUnit: "", manualOverride: false,
   // anti grief
   grief: true, griefPublic: false, griefRebuild: false, griefAll: false, griefLevel: 1,
+  // squad (your own units)
+  squadMode: "follow", squadForm: "circle", squadSpacing: 3, squadDist: 5, squadRadius: 25, squadShoot: false, squadVia: "game", squadOrbitR: 8, squadOrbitSpeed: 60, squadOrbitDir: 1,
   // misc
-  markName: false, announce: true, barMin: false, monitor: false, coords: true, escortDist: 5, escortAngle: 150, tab: 0
+  chatSpots: true, markName: false, announce: true, barMin: false, monitor: false, coords: true, escortDist: 5, escortAngle: 150, tab: 0
 };
 
 var MARK = "\u200b\u200c\u200b";      // optional invisible name tag
@@ -41,6 +43,11 @@ var undoStack = [], griefLog = [], tally = {}, removed = [], flagged = {}, ignor
 var lastSwitch = 0, lastRebuildToast = 0, speedBase = {}, speedType = null, speedAt = 0;
 var barRef = null, ensureAt = 0;
 var statusCache = "", statusAt = 0, powerBad = [], powerAt = 0;
+// performance: how often the heavier checks run (the cheap per-frame work stays per-frame)
+var fr = 0, sqPhaseT = 0, assistSearchAt = 0, planAt = 0, planSize = -1, planNX = 0, planNY = 0, planKX = 0, planKY = 0, planHave = false;
+var healRP = null, healRPAt = 0, rebuildAt = 0, oreVerAt = 0, rangeAt = 0, rangeList = [], profNs = 0, profFrames = 0, profMs = 0;
+var chatSpots = [], lastTopLine = "", gotoPos = null, spotBtn = null, lastSpotTxt = "", spotAt = 0;
+var lastTexts = {}, textsSeen = 0, chatReadOk = null, pendingTexts = [];
 var respawnPos = null, modSeen = {}, lastPing = 0, pingDue = 0, detectAt = 0, infoCache = "", infoAt2 = 0, worldStart = Time.millis();
 
 // Explicit wrappers: Mindustry's Rhino can't pick between overloads when given a bare function
@@ -48,6 +55,8 @@ function mkCons(f){ return new Packages.arc.func.Cons({get: f}); }
 function mkRun(f){ return new java.lang.Runnable({run: f}); }
 function mkBoolc(f){ return new Packages.arc.func.Boolc({get: f}); }
 function mkProv(f){ return new Packages.arc.func.Prov({get: f}); }
+function mkFloatc(f){ return new Packages.arc.func.Floatc({get: f}); }
+function mkBoolf(f){ return new Packages.arc.func.Boolf({get: f}); }
 function eachOf(group, f){ group.each(mkCons(f)); }
 
 function toast(msg){ Vars.ui.showInfoToast(msg, 3); }
@@ -87,9 +96,9 @@ function manualInput(){
 function overridden(){ return S.manualOverride && Time.millis() - lastManual < 800; }
 
 function chatAlert(msg){
-  try{ Vars.ui.chatfrag.addMessage("[scarlet][Anti-grief][white] " + msg); }
+  try{ Vars.ui.chatfrag.addMessage("[#b05050]AG[] [#c88a8a]" + msg + "[]"); }
   catch(err){ Vars.ui.showInfoToast("[scarlet]" + msg, 4); }
-  try{ if(S.griefPublic && Vars.net.active()) Call.sendChatMessage("[Anti-grief] " + msg); }catch(err){}
+  try{ if(S.griefPublic && Vars.net.active()) Call.sendChatMessage("[AG] " + msg); }catch(err){}
 }
 
 function replaceMap(){
@@ -185,7 +194,8 @@ function assistTick(u, core){
          u.dst(lp.unit()) <= S.helpTiles * 12 && !(ignoreUntil[lp.id] > Time.millis()) &&
          (lp.unit().activelyBuilding() || Time.millis() - lastBuildSeen < 4000)) p = lp;
     }
-    if(p == null){
+    if(p == null && Time.millis() - assistSearchAt >= 250){
+      assistSearchAt = Time.millis();
       var best = 1e9;
       eachOf(Groups.player, q => {
         if(q == Vars.player || q.dead() || !sameTeam(q)) return;
@@ -284,30 +294,40 @@ var plannerSkipUntil = 0, planKey = "", planSince = 0, stuckPlanKey = "", stuckS
 function plannerTick(u){
   if(!u.canBuild()) return false;
   if(assistCopied) return false; // that plan belongs to the person we were helping
-  if(Time.millis() < plannerSkipUntil) return false;
-  if(u.plans.size == 0){ planHold = false; return false; }
-  var first = u.buildPlan();
-  if(ourPlan != null && first != null && first.x == ourPlan.x && first.y == ourPlan.y) return false; // rebuild handles its own
+  var now = Time.millis();
+  if(now < plannerSkipUntil) return false;
+  var qsz = u.plans.size;
+  if(qsz == 0){ planHold = false; planHave = false; return false; }
+  if(ourPlan != null){
+    var first = u.buildPlan();
+    if(first != null && first.x == ourPlan.x && first.y == ourPlan.y) return false; // rebuild handles its own
+  }
   if(manualInput()) return false; // you are steering
   u.updateBuilding = true;
-  // The game keeps shuffling the queue, so look at all queued plans, not just the first.
   var br = (u.type.buildRange > 0 ? u.type.buildRange : Vars.buildingRange) - 50;
-  var n = Math.min(u.plans.size, 60);
-  var near = null, nd = 1e9;
-  for(var i = 0; i < n; i++){
-    var pl = u.plans.get(i);
-    var d = Mathf.dst(u.x, u.y, pl.drawx(), pl.drawy());
-    if(d < nd){ nd = d; near = pl; }
+  // The game keeps shuffling the queue, so look at all queued plans. That scan is only
+  // redone a few times a second (or when the queue size changes); distances are cheap each frame.
+  if(!planHave || now - planAt > 150 || qsz != planSize){
+    planAt = now; planSize = qsz;
+    var n = Math.min(qsz, 60);
+    var near = null, nd0 = 1e9;
+    for(var i = 0; i < n; i++){
+      var pl = u.plans.get(i);
+      var d0 = Mathf.dst(u.x, u.y, pl.drawx(), pl.drawy());
+      if(d0 < nd0){ nd0 = d0; near = pl; }
+    }
+    planNX = near.drawx(); planNY = near.drawy(); planKX = near.x; planKY = near.y; planHave = true;
   }
+  var nd = Mathf.dst(u.x, u.y, planNX, planNY);
   // Once something is in build range: stop dead and stay put. Only start moving again
   // when nothing is within range any more (the extra 40 stops it flip-flopping at the edge).
   if(planHold){ if(nd > br + 40) planHold = false; }
   else if(nd < br) planHold = true;
-  var pk = u.plans.size + ":" + near.x + "," + near.y;
-  if(pk != planKey){ planKey = pk; planSince = Time.millis(); }
-  else if(planHold && Time.millis() - planSince > 15000){
+  var pk = qsz + ":" + planKX + "," + planKY;
+  if(pk != planKey){ planKey = pk; planSince = now; }
+  else if(planHold && now - planSince > 15000){
     // nothing has changed for 15s: the plan cannot be finished, so stop waiting for it
-    plannerSkipUntil = Time.millis() + 20000;
+    plannerSkipUntil = now + 20000;
     planHold = false; planKey = "";
     return false;
   }
@@ -315,7 +335,7 @@ function plannerTick(u){
     u.vel.setZero();
     return true;
   }
-  moveToward(u, near.drawx(), near.drawy(), br - 30);
+  moveToward(u, planNX, planNY, br - 30);
   return true;
 }
 
@@ -326,6 +346,9 @@ function rebuildTick(u){
   var cur = u.buildPlan();
   if(cur == null){
     if(q.size == 0) return false;
+    var nowR = Time.millis();
+    if(nowR - rebuildAt < 250) return true;
+    rebuildAt = nowR;
     var bp = q.first();
     var t = Vars.world.tile(bp.x, bp.y);
     var blk = Vars.content.block(bp.block);
@@ -372,8 +395,12 @@ function healTick(u, core){
   if(u.health < u.maxHealth * (S.healAt / 100)) healing = true;
   else if(u.health > u.maxHealth * 0.9) healing = false;
   if(!healing) return false;
-  var rp = null;
-  try{ rp = Geometry.findClosest(u.x, u.y, Vars.indexer.getFlagged(u.team, BlockFlag.repair)); }catch(err){}
+  var nowH = Time.millis();
+  if(nowH - healRPAt > 1000){
+    healRPAt = nowH; healRP = null;
+    try{ healRP = Geometry.findClosest(u.x, u.y, Vars.indexer.getFlagged(u.team, BlockFlag.repair)); }catch(err){}
+  }
+  var rp = healRP;
   var tx, ty;
   if(rp != null){ tx = rp.x; ty = rp.y; healInfo = "repair point"; }
   else if(core != null){ tx = core.x; ty = core.y; healInfo = "core (no repair point)"; }
@@ -559,10 +586,14 @@ function mineTick(u, core){
     return true;
   }
   fullSince = 0;
-  if(u.mineTile != null && !oreOk(u.mineTile, item)){ u.mineTile = null; oreTile = null; }
+  var recheck = now - oreVerAt > 300;
+  if(recheck){
+    oreVerAt = now;
+    if(u.mineTile != null && !oreOk(u.mineTile, item)){ u.mineTile = null; oreTile = null; }
+  }
   if(matching() && item == matchItem){
     oreTile = matchTile; oreItem = item;
-  }else if(oreTile == null || oreItem != item || !oreOk(oreTile, item)){
+  }else if(oreTile == null || oreItem != item || (recheck && !oreOk(oreTile, item))){
     oreTile = null;
     if(now >= oreRetryAt){
       oreTile = findOre(u, item, core.x, core.y, true);
@@ -630,19 +661,37 @@ function unitSwitchTick(){
 // ---------- finding other Mobile Tools users ----------
 function detectTick(){
   var now = Time.millis();
-  if(now - detectAt < 500) return;
+  if(now - detectAt < 1000) return;
   detectAt = now;
   eachOf(Groups.player, q => {
     if(q == Vars.player) return;
-    try{ if(String(q.lastText).indexOf(PING) >= 0) modSeen[q.id] = true; }catch(err){}
+    try{
+      var lt = String(q.lastText);
+      if(lt.indexOf(PING) >= 0) modSeen[q.id] = true;
+      else if(lt.length > 0 && lastTexts[q.id] !== lt){
+        var firstLook = lastTexts[q.id] === undefined; // the message that was already there when we joined
+        lastTexts[q.id] = lt;
+        if(!firstLook){
+          textsSeen++;
+          if(S.chatSpots) pendingTexts.push(dname(q) + ": " + lt);
+        }
+      }
+    }catch(err){}
   });
+  // read the coordinates here, outside the game's callback, so a problem can never reach the connection
+  if(pendingTexts.length > 0){
+    var pt = pendingTexts; pendingTexts = [];
+    for(var pi = 0; pi < pt.length; pi++){ try{ addSpots(pt[pi]); }catch(err){ Log.err(err); } }
+  }
   try{
     var msgs = Packages.arc.util.Reflect.get(Vars.ui.chatfrag, "messages");
-    for(var i = msgs.size - 1; i >= 0; i--){
+    chatScan(msgs);
+    chatReadOk = true;
+    for(var i = msgs.size - 1; i >= Math.max(0, msgs.size - 40); i--){
       var line = String(msgs.get(i));
       if(line.indexOf(PING) >= 0) msgs.remove(line);
     }
-  }catch(err){}
+  }catch(err){ chatReadOk = false; }
   if(S.announce && pingDue > 0 && now >= pingDue && Vars.net.active()){
     pingDue = 0;
     lastPing = now;
@@ -666,7 +715,7 @@ function ensureBar(){
 // ---------- tap the map to see its coordinates ----------
 var tapDown = false, tapSX = 0, tapSY = 0, tapT = 0, coordMark = null;
 function coordTick(){
-  if(!S.coords){ tapDown = false; return; }
+  if(!S.coords && sqTapMode == null){ tapDown = false; return; }
   if(Core.input.justTouched()){
     var onUi = false;
     try{ onUi = Core.scene.hasMouse(); }catch(err){}
@@ -677,6 +726,7 @@ function coordTick(){
     tapDown = false;
     if(Time.millis() - tapT < 500 && Math.abs(Core.input.mouseX() - tapSX) + Math.abs(Core.input.mouseY() - tapSY) < 20){
       var w = Core.input.mouseWorld(tapSX, tapSY);
+      if(sqTapMode != null){ sqTap(w.x, w.y); return; }
       var tx = Math.round(w.x / 8), ty = Math.round(w.y / 8);
       var what = "";
       try{
@@ -689,9 +739,340 @@ function coordTick(){
   }
 }
 
+// ---------- squad: command your own units (ported from Mobile Tools+) ----------
+var SQ_FORMS = ["circle", "line", "wedge", "grid", "column"];
+var sqPhase = 0, sqOrder = [], sqCtl = {}, sqPend = [], sqTapMode = null, sqMoveTarget = null, sqAtk = null, sqAtkUntil = 0, sqWarned = false;
+var CmdAI = null, LogicAIc = null, BuildingC = null;
+try{
+  CmdAI = Packages.mindustry.ai.types.CommandAI;
+  LogicAIc = Packages.mindustry.ai.types.LogicAI;
+  BuildingC = Packages.mindustry.gen.Building;
+}catch(err){}
+
+function sqSave(){
+  try{
+    Core.settings.put("mt-squad", "" + JSON.stringify({squadForm: S.squadForm, squadSpacing: S.squadSpacing, squadDist: S.squadDist, squadRadius: S.squadRadius, squadShoot: S.squadShoot, squadVia: S.squadVia, squadOrbitR: S.squadOrbitR, squadOrbitSpeed: S.squadOrbitSpeed, squadOrbitDir: S.squadOrbitDir}));
+  }catch(err){}
+}
+function sqDead(u){ try{ return typeof u.dead === "function" ? u.dead() : !!u.dead; }catch(err){ return false; } }
+function sqIsClient(){ return Vars.net.client(); }
+function sqFail(e){ Log.err("[MobileTools] squad command failed: " + e); if(!sqWarned){ sqWarned = true; toast("[scarlet]Squad command failed (see log)", 4); } }
+function sqIsCmdAI(u){ try{ return CmdAI != null && u.controller() instanceof CmdAI; }catch(err){ return false; } }
+
+function sqCanSelect(u){
+  try{
+    return u != null && u.isValid() && !sqDead(u) && u.team.id == Vars.player.team().id && !u.isPlayer() && !(LogicAIc != null && u.controller() instanceof LogicAIc);
+  }catch(err){ return false; }
+}
+function sqAdopt(u){
+  if(sqCtl[u.id]) return sqCtl[u.id];
+  var c = {u: u, hold: null, sx: null, sy: null, t0: 0, tk: null, t1: 0};
+  // in single player / hosting we can switch the unit into Command mode ourselves
+  try{ if(!sqIsClient() && CmdAI != null && !sqIsCmdAI(u)) u.controller(new CmdAI()); }catch(err){ sqFail("switch to command mode: " + err); }
+  sqCtl[u.id] = c;
+  return c;
+}
+function sqAdd(u){
+  if(sqCtl[u.id] || !sqCanSelect(u)) return false;
+  sqAdopt(u); sqOrder.push(u.id);
+  return true;
+}
+function sqRemove(id){
+  var i = sqOrder.indexOf(id);
+  if(i >= 0) sqOrder.splice(i, 1);
+  delete sqCtl[id];
+}
+function sqClear(){ while(sqOrder.length) sqRemove(sqOrder[0]); sqMoveTarget = null; sqAtk = null; }
+function sqToggle(u){ if(sqCtl[u.id]) sqRemove(u.id); else sqAdd(u); }
+function sqPrune(){
+  for(var i = sqOrder.length - 1; i >= 0; i--){
+    var c = sqCtl[sqOrder[i]];
+    if(!c || !c.u.isValid() || c.u.team.id != Vars.player.team().id){
+      if(c) delete sqCtl[sqOrder[i]];
+      sqOrder.splice(i, 1);
+    }
+  }
+}
+function sqSelNearby(){
+  if(!alive()) return;
+  var pu = me(), r = S.squadRadius * 8, n = 0;
+  eachOf(Groups.unit, u => { if(sqCanSelect(u) && Mathf.dst(u.x, u.y, pu.x, pu.y) <= r && sqAdd(u)) n++; });
+  toast("Selected " + n + " unit(s), total " + sqOrder.length);
+}
+// copy the units picked in the game's own Command mode
+function sqSync(){
+  var n = 0;
+  try{
+    var sel = Vars.control.input.selectedUnits;
+    for(var i = 0; i < sel.size; i++) if(sqAdd(sel.get(i))) n++;
+  }catch(err){ toast("[scarlet]Couldn't read the Command mode selection"); return; }
+  toast("Took " + n + " unit(s) from Command mode, total " + sqOrder.length);
+}
+
+// formation slots (offset from the middle, world units)
+function sqSlot(i, n, rot){
+  var sp = S.squadSpacing * 8, fd = S.squadDist * 8, x = 0, y = 0;
+  switch(S.squadForm){
+    case "line": x = -fd; y = (i - (n - 1) / 2) * sp; break;
+    case "column": x = -fd - i * sp; y = 0; break;
+    case "wedge": { var row = Math.floor((1 + Math.sqrt(1 + 8 * i)) / 2) - 1; var first = row * (row + 1) / 2; var k = i - first; x = -fd - row * sp; y = (k - row / 2) * sp; break; }
+    case "grid": { var cols = Math.max(1, Math.ceil(Math.sqrt(n))); x = -fd - Math.floor(i / cols) * sp; y = (i % cols - (cols - 1) / 2) * sp; break; }
+    default: { var r = Math.max(fd, sp * n / (2 * Math.PI)); var a = i * 360 / n; x = Mathf.cosDeg(a) * r; y = Mathf.sinDeg(a) * r; }
+  }
+  Tmp.v1.set(x, y).rotate(rot);
+  return [Tmp.v1.x, Tmp.v1.y];
+}
+
+// commands are queued during the tick, then sent through the game's own Command mode
+function sqCmdPos(c, x, y){
+  var now = Time.millis();
+  if(c.sx != null && now - c.t0 < 300) return;
+  if(c.sx != null && Mathf.dst(c.sx, c.sy, x, y) < 10 && now - c.t0 < 1500) return;
+  c.sx = x; c.sy = y; c.t0 = now; c.tk = null;
+  sqPend.push({c: c, x: x, y: y, t: null});
+}
+function sqCmdAttack(c, tgt){
+  var now = Time.millis();
+  var isB = BuildingC != null && tgt instanceof BuildingC;
+  var key = (isB ? "b" : "u") + (isB ? tgt.pos() : tgt.id);
+  if(c.tk === key && now - c.t1 < 1500) return;
+  c.tk = key; c.t1 = now; c.sx = null;
+  sqPend.push({c: c, x: tgt.getX(), y: tgt.getY(), t: tgt});
+}
+// world position -> the screen position the game's own input turns back into that spot
+function sqScreenOf(x, y){
+  var cam = Core.camera, W = Core.graphics.getWidth(), H = Core.graphics.getHeight();
+  var sx = ((x - cam.position.x) / cam.width + 0.5) * W, syUp = ((y - cam.position.y) / cam.height + 0.5) * H;
+  var w = Core.input.mouseWorld(sx, syUp);
+  if(Mathf.dst(w.x, w.y, x, y) < 6) return [sx, syUp];
+  return [sx, H - syUp];
+}
+function sqDirect(it){
+  try{
+    if(it.t){
+      var isB = BuildingC != null && it.t instanceof BuildingC;
+      Call.commandUnits(Vars.player, [it.c.u.id], isB ? it.t : null, isB ? null : it.t, null);
+    }else if(!sqIsClient() && sqIsCmdAI(it.c.u)) it.c.u.controller().commandPosition(new Packages.arc.math.geom.Vec2(it.x, it.y));
+    else Call.commandUnits(Vars.player, [it.c.u.id], null, null, new Packages.arc.math.geom.Vec2(it.x, it.y));
+  }catch(err){ sqFail(err); }
+}
+function sqFlush(){
+  if(!sqPend.length) return;
+  var list = sqPend; sqPend = [];
+  if(S.squadVia == "game"){
+    var inp = Vars.control.input, oldSel = null, oldMode = false;
+    try{
+      oldSel = new Packages.arc.struct.Seq(inp.selectedUnits); oldMode = inp.commandMode;
+      inp.commandMode = true;
+      for(var i = 0; i < list.length; i++){
+        var it = list[i]; if(!it.c.u.isValid()) continue;
+        inp.selectedUnits.clear(); inp.selectedUnits.add(it.c.u);
+        var sp = sqScreenOf(it.x, it.y);
+        inp.commandTap(sp[0], sp[1]);
+      }
+      inp.selectedUnits.set(oldSel); inp.commandMode = oldMode;
+      return;
+    }catch(err){
+      try{ if(oldSel) inp.selectedUnits.set(oldSel); inp.commandMode = oldMode; }catch(x){}
+      sqFail("game command tap: " + err);
+      S.squadVia = "direct"; sqSave(); toast("[scarlet]Game click method failed, switched to direct commands", 4);
+    }
+  }
+  for(var j = 0; j < list.length; j++) sqDirect(list[j]);
+}
+
+function squadTick(){
+  if(sqOrder.length == 0 || !alive()) return;
+  sqPrune();
+  var n = sqOrder.length;
+  if(n == 0) return;
+  var pu = me(), px = pu.x, py = pu.y, rot = pu.rotation;
+  var now = Time.millis();
+  var cx = px, cy = py;
+  if(S.squadMode == "move" && sqMoveTarget){ cx = sqMoveTarget.x; cy = sqMoveTarget.y; }
+  if(S.squadMode == "orbit"){
+    var dtm = sqPhaseT == 0 ? 16 : Math.min(250, now - sqPhaseT);
+    sqPhase = (sqPhase + S.squadOrbitDir * S.squadOrbitSpeed * dtm / 1000) % 360;
+  }
+  sqPhaseT = now;
+  // an enemy to attack: one you tapped, or the one closest to where you are shooting
+  var tgt = null;
+  if(sqAtk != null && now < sqAtkUntil && sqAtk.isValid()) tgt = sqAtk;
+  else sqAtk = null;
+  if(tgt == null && S.squadShoot && (pu.isShooting || Vars.player.shooting)){
+    try{ tgt = Units.closestTarget(Vars.player.team(), pu.aimX, pu.aimY, 40, mkBoolf(e => true), mkBoolf(b => true)); }catch(err){}
+  }
+  for(var i = 0; i < n; i++){
+    var c = sqCtl[sqOrder[i]], u = c.u;
+    if(tgt != null){ sqCmdAttack(c, tgt); continue; }
+    var hx, hy;
+    if(S.squadMode == "hold"){
+      if(!c.hold) c.hold = {x: u.x, y: u.y};
+      hx = c.hold.x; hy = c.hold.y;
+    }else if(S.squadMode == "orbit"){
+      c.hold = null;
+      var oa = sqPhase + i * 360 / n;
+      hx = px + Mathf.cosDeg(oa) * S.squadOrbitR * 8;
+      hy = py + Mathf.sinDeg(oa) * S.squadOrbitR * 8;
+    }else{
+      c.hold = null;
+      var sl = sqSlot(i, n, rot);
+      hx = cx + sl[0]; hy = cy + sl[1];
+    }
+    hx = Mathf.clamp(hx, 8, Vars.world.unitWidth() - 8);
+    hy = Mathf.clamp(hy, 8, Vars.world.unitHeight() - 8);
+    sqCmdPos(c, hx, hy);
+  }
+  sqFlush();
+}
+
+// a tap on the map while a squad tap mode is active
+function sqTap(wx, wy){
+  if(sqTapMode == "select"){
+    var best = null, bd = 30;
+    eachOf(Groups.unit, u => {
+      if(!sqCanSelect(u)) return;
+      var d = Mathf.dst(u.x, u.y, wx, wy);
+      if(d < bd){ bd = d; best = u; }
+    });
+    if(best == null){ toast("No unit of yours there"); return; }
+    sqToggle(best);
+    toast("Selected " + sqOrder.length + " unit(s)");
+  }else if(sqTapMode == "move"){
+    sqMoveTarget = {x: wx, y: wy};
+    S.squadMode = "move";
+    sqTapMode = null;
+    toast("Sending your units there");
+  }else if(sqTapMode == "attack"){
+    var t = null;
+    try{ t = Units.closestTarget(Vars.player.team(), wx, wy, 30, mkBoolf(e => true), mkBoolf(b => true)); }catch(err){}
+    if(t == null){ toast("Nothing to attack there"); return; }
+    sqAtk = t; sqAtkUntil = Time.millis() + 10000;
+    sqTapMode = null;
+    toast("Attacking");
+  }
+}
+
+// ---------- coordinates people say in chat ----------
+// Reading coordinates by hand, character by character: the game's own regular-expression engine
+// crashes on some patterns, so no regular expressions are used anywhere in this mod.
+function sqNum(str, i){ // optional '-', then 1-4 digits -> [value, endIndex, digits] or null
+  var j = i, neg = false;
+  if(str.charAt(j) == "-"){ neg = true; j++; }
+  var st = j;
+  while(j < str.length && j - st < 5){
+    var c = str.charCodeAt(j);
+    if(c < 48 || c > 57) break;
+    j++;
+  }
+  var n = j - st;
+  if(n < 1 || n > 4) return null;
+  var v = parseInt(str.substring(st, j), 10);
+  return [neg ? -v : v, j, str.substring(st, j)];
+}
+function skipSp(str, i){ while(i < str.length && str.charAt(i) == " ") i++; return i; }
+function isDig(c){ return c >= 48 && c <= 57; }
+
+function addSpots(line){
+  var raw = String(Strings.stripColors(line));
+  var plain = "", prevSp = false;
+  for(var q = 0; q < raw.length; q++){
+    var ch = raw.charAt(q);
+    if(ch == " " || ch == "\t" || ch == "\n" || ch == "\r"){ if(!prevSp) plain += " "; prevSp = true; }
+    else{ plain += ch; prevSp = false; }
+  }
+  var W = Vars.world.width(), H = Vars.world.height();
+  var found = [];
+
+  // "100,169", "100, 169", "(100, 169)", "@100,169"
+  for(var i = 0; i < plain.length; i++){
+    var c0 = plain.charCodeAt(i);
+    var start = isDig(c0) || (plain.charAt(i) == "-" && i + 1 < plain.length && isDig(plain.charCodeAt(i + 1)));
+    if(!start) continue;
+    if(i > 0 && isDig(plain.charCodeAt(i - 1))) continue; // middle of a longer number
+    var a = sqNum(plain, i);
+    if(a == null) continue;
+    var j = skipSp(plain, a[1]);
+    if(plain.charAt(j) != ","){ i = a[1] - 1; continue; }
+    j = skipSp(plain, j + 1);
+    var b = sqNum(plain, j);
+    if(b == null) continue;
+    if(b[1] < plain.length && isDig(plain.charCodeAt(b[1]))) continue;
+    i = b[1] - 1;
+    if(b[2] == "000") continue; // "1,000 copper" is not a spot
+    if(a[0] >= 0 && b[0] >= 0 && a[0] < W && b[0] < H) found.push([a[0], b[0]]);
+  }
+
+  // "x 100 y 169", "x:100, y=169"
+  for(var k = 0; k < plain.length; k++){
+    var xc = plain.charAt(k);
+    if(xc != "x" && xc != "X") continue;
+    if(k > 0){ // the x must stand alone, not sit inside a word like "max"
+      var pcx = plain.charAt(k - 1);
+      if((pcx >= "a" && pcx <= "z") || (pcx >= "A" && pcx <= "Z") || isDig(plain.charCodeAt(k - 1))) continue;
+    }
+    var j2 = skipSp(plain, k + 1);
+    var sep = plain.charAt(j2);
+    if(sep == ":" || sep == "=") j2 = skipSp(plain, j2 + 1);
+    var a2 = sqNum(plain, j2);
+    if(a2 == null) continue;
+    var yAt = -1;
+    for(var r = a2[1]; r < Math.min(plain.length, a2[1] + 7); r++){
+      if(isDig(plain.charCodeAt(r))) break;
+      var yc = plain.charAt(r);
+      if(yc == " " || yc == "," || yc == ";") continue; // only separators may sit between x and y
+      if(yc == "y" || yc == "Y") yAt = r;
+      break;
+    }
+    if(yAt < 0) continue;
+    var j3 = skipSp(plain, yAt + 1);
+    var sep2 = plain.charAt(j3);
+    if(sep2 == ":" || sep2 == "=") j3 = skipSp(plain, j3 + 1);
+    var b2 = sqNum(plain, j3);
+    if(b2 == null) continue;
+    if(a2[0] >= 0 && b2[0] >= 0 && a2[0] < W && b2[0] < H) found.push([a2[0], b2[0]]);
+  }
+
+  var now = Time.millis();
+  for(var n = 0; n < found.length; n++){
+    var f = found[n];
+    if(chatSpots.length > 0 && chatSpots[0].x == f[0] && chatSpots[0].y == f[1] && now - chatSpots[0].t < 10000) continue;
+    chatSpots.unshift({x: f[0], y: f[1], text: plain.substring(0, 60), t: now});
+    if(chatSpots.length > 8) chatSpots.pop();
+  }
+}
+function chatScan(msgs){
+  if(!S.chatSpots || msgs.size == 0) return;
+  // newest message is first in the list; skip our own invisible pings
+  var t0 = 0;
+  while(t0 < msgs.size && String(msgs.get(t0)).indexOf(PING) >= 0) t0++;
+  if(t0 >= msgs.size) return;
+  var top = String(msgs.get(t0));
+  if(lastTopLine == ""){ lastTopLine = top; return; } // don't read old chat on the first look
+  if(top == lastTopLine) return;
+  var fresh = [];
+  for(var i = t0; i < Math.min(t0 + 10, msgs.size); i++){
+    var line = String(msgs.get(i));
+    if(line == lastTopLine) break;
+    if(line.indexOf(PING) < 0) fresh.push(line);
+  }
+  lastTopLine = top;
+  for(var j = fresh.length - 1; j >= 0; j--) addSpots(fresh[j]); // oldest first, so the newest ends up on top
+}
+function goToSpot(sp){
+  if(!alive()){ toast("You need a unit to go there"); return; }
+  gotoPos = {x: sp.x * 8, y: sp.y * 8};
+  toast("Going to " + sp.x + "," + sp.y + " (tap Stop to cancel)");
+}
+
 // ---------- brain ----------
 function runBrain(u, core){
   if(!S.assist && assistCopied) dropCopied(u);
+  if(gotoPos != null){
+    u.mineTile = null; mineInfo = "";
+    if(moveToward(u, gotoPos.x, gotoPos.y, 24)){ gotoPos = null; toast("Arrived"); }
+    return true;
+  }
   if(S.goCore){
     if(core == null){ S.goCore = false; return false; }
     if(moveToward(u, core.x, core.y, 40)) S.goCore = false;
@@ -705,13 +1086,17 @@ function runBrain(u, core){
   return false;
 }
 
-Events.run(EventType.Trigger.update, () => {
+function modUpdate(){
+  fr++;
   holdOn = false;
   holdMineOn = false;
   if(Vars.state.isGame()){
     try{ detectTick(); }catch(err){}
     try{ coordTick(); }catch(err){}
     ensureBar();
+    if((fr & 3) == 0){
+      try{ squadTick(); }catch(err){ Log.err(err); sqClear(); toast("[scarlet]Squad error, selection cleared"); }
+    }
     if(respawnPos != null){
       if(Time.millis() > respawnPos.until) respawnPos = null;
       else if(Vars.player.dead()) Vars.player.set(respawnPos.x, respawnPos.y);
@@ -736,10 +1121,18 @@ Events.run(EventType.Trigger.update, () => {
     S.assist = false; S.mine = false; S.rebuild = false; S.heal = false; S.goCore = false; S.buildNav = false;
     toast("[scarlet]Mobile Tools error, automation turned off");
   }
+}
+Events.run(EventType.Trigger.update, () => {
+  var t0 = Time.nanos();
+  modUpdate();
+  profNs += Time.nanos() - t0;
+  profFrames++;
+  if(profFrames >= 120){ profMs = profNs / profFrames / 1e6; profNs = 0; profFrames = 0; }
 });
 
 // ---------- draw hook: runs after the game's own input each frame ----------
-Events.run(EventType.Trigger.draw, () => {
+function modDraw(){
+  if(!holdOn && !holdMineOn && shootSrc == null && coordMark == null && gotoPos == null && !(S.squadMode == "orbit" && sqOrder.length > 0) && !(S.turretRanges || S.enemyRanges || S.unitRanges || S.power)) return;
   try{
     // while automation is in charge, undo movement/mining resets the normal controls added
     if(holdOn && alive() && me() == holdUnit) holdUnit.vel.set(holdV);
@@ -773,27 +1166,67 @@ Events.run(EventType.Trigger.draw, () => {
     }
   }catch(err){ coordMark = null; }
 
+  try{
+    if(S.squadMode == "orbit" && sqOrder.length > 0 && alive()){
+      var opu = me();
+      Draw.z(Layer.overlayUI);
+      Draw.color(Color.white, 0.25);
+      Lines.stroke(1);
+      Lines.circle(opu.x, opu.y, S.squadOrbitR * 8);
+      Draw.reset();
+    }
+  }catch(err){}
+
+  try{
+    if(gotoPos != null){
+      Draw.z(Layer.overlayUI);
+      Lines.stroke(2);
+      Draw.color(Color.white, 0.9);
+      Lines.circle(gotoPos.x, gotoPos.y, 10);
+      Draw.reset();
+    }
+  }catch(err){}
+
   if(!Vars.state.isGame()) return;
   if(!(S.turretRanges || S.enemyRanges || S.unitRanges || S.power)) return;
   try{
     var mine = Vars.player.team();
-    Core.camera.bounds(Tmp.r1);
-    Tmp.r1.grow(320);
+    var nowD = Time.millis();
+    if(!(S.turretRanges || S.enemyRanges || S.unitRanges)) rangeList = [];
+    else if(nowD - rangeAt > 250){
+      rangeAt = nowD;
+      Core.camera.bounds(Tmp.r1);
+      Tmp.r1.grow(320);
+      var lst = [];
+      if(S.turretRanges){
+        eachOf(Vars.indexer.getFlagged(mine, BlockFlag.turret), b => {
+          if(!Tmp.r1.contains(b.x, b.y)) return;
+          lst.push({x: b.x, y: b.y, r: b.block.range, c: b.team.color, a: 0.6, u: null});
+        });
+      }
+      if(S.enemyRanges){
+        eachOf(Vars.indexer.getEnemy(mine, BlockFlag.turret), b => {
+          if(!Tmp.r1.contains(b.x, b.y)) return;
+          lst.push({x: b.x, y: b.y, r: b.block.range, c: b.team.color, a: 0.6, u: null});
+        });
+      }
+      if(S.unitRanges){
+        eachOf(Groups.unit, un => {
+          if(un.team == mine || !Tmp.r1.contains(un.x, un.y)) return;
+          lst.push({x: 0, y: 0, r: un.range(), c: un.team.color, a: 0.5, u: un});
+        });
+      }
+      rangeList = lst;
+    }
     Draw.z(Layer.overlayUI);
     Lines.stroke(1.2);
-    if(S.turretRanges){
-      eachOf(Vars.indexer.getFlagged(mine, BlockFlag.turret), b => {
-        if(!Tmp.r1.contains(b.x, b.y)) return;
-        Draw.color(b.team.color, 0.6);
-        Lines.circle(b.x, b.y, b.block.range);
-      });
-    }
-    if(S.enemyRanges){
-      eachOf(Vars.indexer.getEnemy(mine, BlockFlag.turret), b => {
-        if(!Tmp.r1.contains(b.x, b.y)) return;
-        Draw.color(b.team.color, 0.6);
-        Lines.circle(b.x, b.y, b.block.range);
-      });
+    for(var ri = 0; ri < rangeList.length; ri++){
+      var re = rangeList[ri];
+      Draw.color(re.c, re.a);
+      if(re.u != null){
+        if(!re.u.isValid()) continue;
+        Lines.circle(re.u.x, re.u.y, re.r);
+      }else Lines.circle(re.x, re.y, re.r);
     }
     if(S.power){
       var now = Time.millis();
@@ -809,19 +1242,17 @@ Events.run(EventType.Trigger.draw, () => {
       Draw.color(Color.scarlet, 0.9);
       for(var i = 0; i < powerBad.length; i++) Lines.circle(powerBad[i].x, powerBad[i].y, powerBad[i].r);
     }
-    if(S.unitRanges){
-      eachOf(Groups.unit, un => {
-        if(un.team == mine || !Tmp.r1.contains(un.x, un.y)) return;
-        Draw.color(un.team.color, 0.5);
-        Lines.circle(un.x, un.y, un.range());
-      });
-    }
     Draw.reset();
   }catch(err){
     Log.err(err);
     S.turretRanges = false; S.enemyRanges = false; S.unitRanges = false; S.power = false;
     Draw.reset();
   }
+}
+Events.run(EventType.Trigger.draw, () => {
+  var t0 = Time.nanos();
+  modDraw();
+  profNs += Time.nanos() - t0;
 });
 
 // ---------- anti grief ----------
@@ -859,10 +1290,11 @@ Events.on(EventType.BlockBuildEndEvent, e => {
       rec.n++;
       if(rec.n >= gl[0] && !flagged[p.id]){
         flagged[p.id] = dname(p); // stays watched for the rest of the session
-        var msg = dname(p) + " deconstructed " + rec.n + " blocks in " + (gl[1] / 1000) + "s, near " + e.tile.x + "," + e.tile.y;
+        var msg = dname(p) + ": " + rec.n + " blocks removed @" + e.tile.x + "," + e.tile.y;
         griefLog.unshift(msg);
         if(griefLog.length > 12) griefLog.pop();
         chatAlert(msg);
+        addSpots(msg);
       }
     }
     if(S.griefRebuild && (S.griefAll || flagged[p.id]) && alive()){
@@ -889,6 +1321,8 @@ Events.on(EventType.WorldLoadEvent, e => {
   undoStack = []; tally = {}; removed = []; flagged = {}; modSeen = {}; ignoreUntil = {};
   worldStart = Time.millis();
   if(S.announce) pingDue = Time.millis() + 6000;
+  sqClear(); sqTapMode = null;
+  chatSpots = []; lastTopLine = ""; gotoPos = null; lastTexts = {};
   S.goCore = false;
 });
 
@@ -937,6 +1371,7 @@ function statusText(){
   }
   if(S.rebuild) s.push("rebuild" + (alive() ? "(" + me().team.data().plans.size + ")" : ""));
   if(S.wantUnit != "") s.push("unit:" + S.wantUnit);
+  if(sqOrder.length > 0) s.push("squad:" + sqOrder.length + " " + S.squadMode + (S.squadShoot ? "+shoot" : ""));
   if(S.mine) s.push("mine:" + MINE_CHOICES[S.mineIdx] + (mineInfo != "" ? " [" + mineInfo + "]" : ""));
   statusCache = s.length ? "[accent]" + s.join(" ") : "";
   return statusCache;
@@ -948,7 +1383,7 @@ function infoText(){
   infoAt2 = now;
   var sec = Math.max(0, Math.floor((now - worldStart) / 1000));
   var mm = Math.floor(sec / 60), ss = sec % 60;
-  infoCache = Core.graphics.getFramesPerSecond() + " fps   " + mm + ":" + (ss < 10 ? "0" : "") + ss;
+  infoCache = Core.graphics.getFramesPerSecond() + " fps   " + mm + ":" + (ss < 10 ? "0" : "") + ss + "   mod " + profMs.toFixed(2) + "ms";
   return infoCache;
 }
 
@@ -959,6 +1394,11 @@ S.announce = Core.settings.getBool("mt-announce", true);
 S.barMin = Core.settings.getBool("mt-min", false);
 S.coords = Core.settings.getBool("mt-coords", true);
 S.lifo = Core.settings.getBool("mt-lifo", false);
+S.chatSpots = Core.settings.getBool("mt-spots", true);
+try{
+  var sqSaved = JSON.parse(String(Core.settings.getString("mt-squad", "{}")));
+  for(var sqk in sqSaved) if(sqk.indexOf("squad") == 0 && sqk != "squadMode") S[sqk] = sqSaved[sqk];
+}catch(err){}
 S.monitor = Core.settings.getBool("mt-mon", false);
 try{
   S.griefLevel = parseInt(String(Core.settings.getString("mt-gl", "1")));
@@ -981,6 +1421,8 @@ Events.on(EventType.ClientLoadEvent, e => {
   unitPicker.addCloseButton();
   var rebuildPicker = new BaseDialog("Rebuild blocks removed by...");
   rebuildPicker.addCloseButton();
+  var spotsDlg = new BaseDialog("Chat coordinates");
+  spotsDlg.addCloseButton();
 
   var TOGST = null;
   try{ TOGST = Styles.togglet; }catch(err){}
@@ -993,6 +1435,26 @@ Events.on(EventType.ClientLoadEvent, e => {
   }
   function toggle(p, label, key){ p.check(label, S[key], mkBoolc(v => { S[key] = v; })).left().row(); }
   function btn(p, label, run){ p.button(label, mkRun(run)).growX().height(46).pad(2).row(); }
+  function slide(p, label, key, min, max, step){
+    var sl = new Packages.arc.scene.ui.Slider(min, max, step, false);
+    var lab = new Packages.arc.scene.ui.Label("");
+    function upd(){ lab.setText(label + ": [accent]" + (Math.round(S[key] * 100) / 100)); }
+    function set(v, fromSlider){
+      v = Mathf.clamp(Math.round(v / step) * step, min, max);
+      S[key] = v;
+      if(!fromSlider) sl.setValue(v);
+      upd(); sqSave();
+    }
+    sl.setValue(S[key]);
+    upd();
+    sl.moved(mkFloatc(v => set(v, true)));
+    p.add(lab).left().padTop(6).row();
+    var row = new Packages.arc.scene.ui.layout.Table();
+    row.button("-", mkRun(() => set(S[key] - step, false))).size(40);
+    row.add(sl).growX().pad(4);
+    row.button("+", mkRun(() => set(S[key] + step, false))).size(40);
+    p.add(row).growX().padBottom(4).row();
+  }
 
   var TOGI = null, CLEARI = null, BARBG = null;
   try{ TOGI = Styles.clearTogglei; }catch(err){}
@@ -1030,6 +1492,7 @@ Events.on(EventType.ClientLoadEvent, e => {
   function buildBar(){
     holder.clear();
     monL = null; monR = null; monP = null; monAt = 0;
+    spotBtn = null; lastSpotTxt = "";
     try{ if(BARBG != null) holder.background(BARBG); }catch(err){}
     if(S.barMin){
       barButton(holder, null, "+", () => { S.barMin = false; Core.settings.put("mt-min", false); Core.app.post(mkRun(() => buildBar())); });
@@ -1043,7 +1506,7 @@ Events.on(EventType.ClientLoadEvent, e => {
       barToggle(holder, "add", "Heal", "heal");
       barToggle(holder, "eye", "Me", "camFollow");
       barToggle(holder, "chartBar", "Stats", "monitor");
-      barButton(holder, "cancel", "Stop", () => { S.assist = false; S.mine = false; S.rebuild = false; S.goCore = false; S.heal = false; });
+      barButton(holder, "cancel", "Stop", () => { S.assist = false; S.mine = false; S.rebuild = false; S.goCore = false; S.heal = false; gotoPos = null; });
       barButton(holder, null, "-", () => { S.barMin = true; Core.settings.put("mt-min", true); Core.app.post(mkRun(() => buildBar())); });
       holder.row();
       smallLabel(holder.label(mkProv(() => statusText())).colspan(10).left().width(340).wrap());
@@ -1057,6 +1520,9 @@ Events.on(EventType.ClientLoadEvent, e => {
         monP = holder.add("").colspan(10).left().padTop(4).get();
         try{ monL.setFontScale(0.8); monR.setFontScale(0.8); monP.setFontScale(0.8); }catch(err){}
       }
+      holder.row();
+      spotBtn = holder.button("[lightgray]chat spots", mkRun(() => { if(!barDrag.moved) spotClick(); })).colspan(10).left().height(30).get();
+      try{ spotBtn.getLabel().setFontScale(0.7); }catch(err){}
     }
     holder.pack();
   }
@@ -1073,8 +1539,13 @@ Events.on(EventType.ClientLoadEvent, e => {
     if(isNaN(px) || isNaN(py)){ px = defX; py = defY; }
     tbl.setPosition(px, py);
     st.tick = function(){
+      var touched = Core.input.isTouched();
+      if(!touched && !st.dragging){
+        st.n = (st.n || 0) + 1;
+        if(st.n % 30 != 0) return; // idle: only the on-screen check, twice a second
+      }
       var mx = Core.input.mouseX(), my = Core.input.mouseY();
-      if(Core.input.isTouched()){
+      if(touched){
         if(!st.dragging && Core.input.justTouched() && tbl.visible && mx >= tbl.x && mx <= tbl.x + tbl.getWidth() && my >= tbl.y && my <= tbl.y + tbl.getHeight()){
           st.dragging = true; st.moved = false; offX = mx - tbl.x; offY = my - tbl.y; downX = mx; downY = my;
         }
@@ -1171,6 +1642,29 @@ Events.on(EventType.ClientLoadEvent, e => {
       monL.setText("[scarlet]Monitor error: " + err);
     }
     holder.pack();
+  }
+
+  // ----- coordinates seen in chat -----
+  function openSpots(){
+    spotsDlg.cont.clear();
+    spotsDlg.cont.pane(mkCons(p => {
+      p.check("Detect coordinates in chat", S.chatSpots, mkBoolc(v => { S.chatSpots = v; Core.settings.put("mt-spots", v); })).left().row();
+      p.add("[lightgray]Chat list: " + (chatReadOk === null ? "not checked yet" : (chatReadOk ? "readable" : "can't read it")) + "    Player messages seen: " + textsSeen).left().wrap().growX().row();
+      if(gotoPos != null) btn(p, "Stop going there", () => { gotoPos = null; spotsDlg.hide(); });
+      if(chatSpots.length == 0) p.add("[lightgray]No coordinates seen in chat yet (like 100,169).").left().wrap().growX().row();
+      for(var i = 0; i < chatSpots.length; i++){
+        (function(sp){
+          btn(p, "> " + sp.x + "," + sp.y + "   [lightgray]" + sp.text.substring(0, 40), () => { goToSpot(sp); spotsDlg.hide(); });
+        })(chatSpots[i]);
+      }
+    })).grow();
+    spotsDlg.show();
+  }
+  // the small "chat spots" button on the quick bar
+  function spotClick(){
+    if(gotoPos != null){ gotoPos = null; toast("Stopped"); return; }
+    if(chatSpots.length > 0 && Time.millis() - chatSpots[0].t < 60000) goToSpot(chatSpots[0]);
+    else openSpots();
   }
 
   // ----- pickers -----
@@ -1276,6 +1770,7 @@ Events.on(EventType.ClientLoadEvent, e => {
     section(p, "Unit");
     btn(p, "Auto-switch unit: " + (S.wantUnit == "" ? "off" : S.wantUnit) + " (tap to change)", openUnitPicker);
     btn(p, "Fly to closest core", () => { S.goCore = true; });
+    btn(p, "Chat coordinates...", openSpots);
     btn(p, "Respawn", () => { try{ Call.unitClear(Vars.player); }catch(err){ Vars.player.clearUnit(); } });
     toggle(p, "Let me take over (pause automation while I touch)", "manualOverride");
     btn(p, "Show / reset the quick bar", resetBar);
@@ -1291,6 +1786,40 @@ Events.on(EventType.ClientLoadEvent, e => {
     p.add(String(d.p)).left().padTop(8).row();
     btn(p, "Refresh", refresh);
     p.check("Also show it under the quick bar", S.monitor, mkBoolc(v => { S.monitor = v; Core.settings.put("mt-mon", v); })).left().row();
+  }
+
+  function tabSquad(p){
+    section(p, "Your units", "Select your own units, then order them. Orders go through the game's own Command mode, so it works online too.");
+    p.add("[accent]" + sqOrder.length + "[] selected    mode: " + S.squadMode + (sqTapMode != null ? "    [scarlet](waiting for a tap)" : "")).left().row();
+    btn(p, "Select units near me", () => { sqSelNearby(); refresh(); });
+    btn(p, "Tap units on the map to select them", () => { sqTapMode = "select"; menu.hide(); toast("Tap your units to select/deselect. Open the menu to stop."); });
+    btn(p, "Take units selected in Command mode", () => { sqSync(); refresh(); });
+    btn(p, "Clear selection", () => { sqClear(); refresh(); });
+    slide(p, "Select radius (tiles)", "squadRadius", 5, 80, 1);
+
+    section(p, "Orders");
+    btn(p, "Follow me", () => { S.squadMode = "follow"; sqAtk = null; refresh(); });
+    btn(p, "Orbit around me", () => { S.squadMode = (S.squadMode == "orbit") ? "follow" : "orbit"; sqAtk = null; refresh(); });
+    btn(p, "Hold position", () => { S.squadMode = "hold"; sqAtk = null; for(var i = 0; i < sqOrder.length; i++){ var c = sqCtl[sqOrder[i]]; if(c) c.hold = null; } refresh(); });
+    btn(p, "Send to a spot (then tap the map)", () => { sqTapMode = "move"; menu.hide(); toast("Tap where your units should go"); });
+    btn(p, "Attack a target (then tap it)", () => { sqTapMode = "attack"; menu.hide(); toast("Tap the enemy to attack"); });
+
+    section(p, "Shooting", "Your units pick the enemy closest to where you aim and attack it while you shoot.");
+    p.check("Units shoot where I shoot", S.squadShoot, mkBoolc(v => { S.squadShoot = v; sqSave(); })).left().row();
+
+    section(p, "Orbit");
+    slide(p, "Orbit radius (tiles)", "squadOrbitR", 2, 40, 1);
+    slide(p, "Orbit speed (deg/s)", "squadOrbitSpeed", 5, 240, 5);
+    btn(p, "Reverse rotation direction", () => { S.squadOrbitDir = -S.squadOrbitDir; sqSave(); toast(S.squadOrbitDir > 0 ? "Counter-clockwise" : "Clockwise"); });
+
+    section(p, "Formation (follow / send)", "Each unit gets its own spot, so units never bunch up.");
+    btn(p, "Formation: " + S.squadForm + " (tap to change)", () => { S.squadForm = SQ_FORMS[(SQ_FORMS.indexOf(S.squadForm) + 1) % SQ_FORMS.length]; sqSave(); refresh(); });
+    slide(p, "Spacing (tiles)", "squadSpacing", 1, 10, 0.5);
+    slide(p, "Distance from me (tiles)", "squadDist", 1, 25, 1);
+
+    section(p, "Command method");
+    btn(p, "Command method: " + S.squadVia + " (tap to change)", () => { S.squadVia = S.squadVia == "game" ? "direct" : "game"; sqSave(); refresh(); });
+    p.add("[lightgray]game: taps the target in the game's own Command mode. direct: sends the command packet itself.").left().wrap().growX().row();
   }
 
   function tabGuard(p){
@@ -1367,7 +1896,7 @@ Events.on(EventType.ClientLoadEvent, e => {
     p.check("Also tag my name (applies when you rejoin)", S.markName, mkBoolc(v => { S.markName = v; Core.settings.put("mt-mark", v); applyNameMark(); })).left().wrap().growX().row();
   }
 
-  var TABS = [["Help", tabHelp], ["Mine", tabMine], ["Build", tabBuild], ["Unit", tabUnit], ["Guard", tabGuard], ["View", tabView], ["Stats", tabStats], ["Users", tabUsers]];
+  var TABS = [["Help", tabHelp], ["Mine", tabMine], ["Build", tabBuild], ["Unit", tabUnit], ["Guard", tabGuard], ["View", tabView], ["Stats", tabStats], ["Squad", tabSquad], ["Users", tabUsers]];
 
   function refresh(){
     menu.cont.clear();
@@ -1381,7 +1910,7 @@ Events.on(EventType.ClientLoadEvent, e => {
     menu.cont.pane(mkCons(p => { TABS[S.tab][1](p); })).grow();
   }
 
-  menu.shown(mkRun(() => refresh()));
+  menu.shown(mkRun(() => { sqTapMode = null; refresh(); }));
 
   // entry in the game's own Settings screen (also a way to bring the quick bar back)
   try{
@@ -1399,12 +1928,24 @@ Events.on(EventType.ClientLoadEvent, e => {
   buildBar();
 
   barDrag = makeDrag(holder, "mt-pos", 8, Core.graphics.getHeight() * 0.5);
-  var lastPacked = "", lastMon = S.monitor;
+  var lastPackedLen = -1, lastMon = S.monitor;
   holder.update(mkRun(() => {
     holder.visible = Vars.state.isGame();
     if(S.monitor != lastMon){ lastMon = S.monitor; Core.app.post(mkRun(() => buildBar())); }
     if(S.monitor && holder.visible) updateMon();
-    if(statusCache != lastPacked){ lastPacked = statusCache; holder.pack(); }
+    if(spotBtn != null){
+      var nowS = Time.millis();
+      if(nowS - spotAt > 250){
+        spotAt = nowS;
+        var sp0 = chatSpots.length > 0 ? chatSpots[0] : null;
+        var stxt;
+        if(gotoPos != null) stxt = "[accent]going there... tap to stop";
+        else if(sp0 != null && nowS - sp0.t < 60000) stxt = "[accent]> go to " + sp0.x + "," + sp0.y + "  [lightgray]" + sp0.text.substring(0, 24);
+        else stxt = "[lightgray]chat spots" + (chatSpots.length > 0 ? " (" + chatSpots.length + ")" : "");
+        if(stxt != lastSpotTxt){ lastSpotTxt = stxt; spotBtn.setText(stxt); }
+      }
+    }
+    if(statusCache.length != lastPackedLen){ lastPackedLen = statusCache.length; holder.pack(); }
     barDrag.tick();
   }));
   Vars.ui.hudGroup.addChild(holder);
