@@ -21,7 +21,7 @@ var S = {
   // squad (your own units)
   squadMode: "follow", squadForm: "circle", squadSpacing: 3, squadDist: 5, squadRadius: 25, squadShoot: false, squadVia: "game", squadOrbitR: 8, squadOrbitSpeed: 60, squadOrbitDir: 1,
   // misc
-  owner: false, chatSpots: true, markName: false, announce: true, barMin: false, monitor: false, coords: true, escortDist: 5, escortAngle: 150, tab: 0
+  owner: false, spotFly: false, chatSpots: true, markName: false, announce: true, barMin: false, monitor: false, coords: true, escortDist: 5, escortAngle: 150, tab: 0
 };
 
 var MARK = "\u200b\u200c\u200b";      // optional invisible name tag
@@ -52,6 +52,7 @@ var statusCache = "", statusAt = 0, powerBad = [], powerAt = 0;
 var fr = 0, sqPhaseT = 0, assistSearchAt = 0, planAt = 0, planSize = -1, planNX = 0, planNY = 0, planKX = 0, planKY = 0, planHave = false;
 var healRP = null, healRPAt = 0, rebuildAt = 0, oreVerAt = 0, rangeAt = 0, rangeList = [], profNs = 0, profFrames = 0, profMs = 0;
 var chatSpots = [], lastTopLine = "", gotoPos = null, spotBtn = null, lastSpotTxt = "", spotAt = 0;
+var viewPos = null, viewCX = 0, viewCY = 0, viewTouch = false, viewTX = 0, viewTY = 0;
 var lastTexts = {}, textsSeen = 0, chatReadOk = null, pendingTexts = [];
 var respawnPos = null, ownerSeen = {}, modSeen = {}, lastPing = 0, pingDue = 0, detectAt = 0, infoCache = "", infoAt2 = 0, worldStart = Time.millis();
 
@@ -1068,9 +1069,34 @@ function chatScan(msgs){
   for(var j = fresh.length - 1; j >= 0; j--) addSpots(fresh[j]); // oldest first, so the newest ends up on top
 }
 function goToSpot(sp){
-  if(!alive()){ toast("You need a unit to go there"); return; }
-  gotoPos = {x: sp.x * 8, y: sp.y * 8};
-  toast("Going to " + sp.x + "," + sp.y + " (tap Stop to cancel)");
+  if(S.spotFly){
+    if(!alive()){ toast("You need a unit to go there"); return; }
+    gotoPos = {x: sp.x * 8, y: sp.y * 8};
+    toast("Flying to " + sp.x + "," + sp.y + " (tap Stop to cancel)");
+    return;
+  }
+  // default: look at the spot with the camera, the unit stays where it is
+  viewPos = {x: sp.x * 8, y: sp.y * 8};
+  viewCX = Core.camera.position.x; viewCY = Core.camera.position.y;
+  viewTouch = false;
+  coordMark = {x: viewPos.x, y: viewPos.y, until: Time.millis() + 45000};
+  toast("Looking at " + sp.x + "," + sp.y + " (drag the map or tap the button to go back)");
+}
+function viewBack(){ viewPos = null; coordMark = null; viewTouch = false; }
+// glide the camera to the spot; dragging the map hands the camera back
+function viewTick(){
+  if(viewPos == null) return;
+  if(Core.input.isTouched()){
+    var onUi = false;
+    try{ onUi = Core.scene.hasMouse(); }catch(err){}
+    if(!onUi){
+      if(!viewTouch){ viewTouch = true; viewTX = Core.input.mouseX(); viewTY = Core.input.mouseY(); }
+      else if(Math.abs(Core.input.mouseX() - viewTX) + Math.abs(Core.input.mouseY() - viewTY) > 25){ viewBack(); return; }
+    }
+  }else viewTouch = false;
+  viewCX += (viewPos.x - viewCX) * 0.3;
+  viewCY += (viewPos.y - viewCY) * 0.3;
+  Core.camera.position.set(viewCX, viewCY);
 }
 
 // ---------- brain ----------
@@ -1101,6 +1127,7 @@ function modUpdate(){
   if(Vars.state.isGame()){
     try{ detectTick(); }catch(err){}
     try{ coordTick(); }catch(err){}
+    try{ viewTick(); }catch(err){ viewBack(); }
     ensureBar();
     if((fr & 3) == 0){
       try{ squadTick(); }catch(err){ Log.err(err); sqClear(); toast("[scarlet]Squad error, selection cleared"); }
@@ -1114,7 +1141,7 @@ function modUpdate(){
   try{
     var now = Time.millis();
     if(now - speedAt > 500){ speedAt = now; applySpeed(); }
-    if(S.camFollow){ var cu = me(); Core.camera.position.set(cu.x, cu.y); }
+    if(S.camFollow && viewPos == null){ var cu = me(); Core.camera.position.set(cu.x, cu.y); }
     unitSwitchTick();
     if(S.manualOverride && manualInput()) lastManual = now;
     if(overridden()) return;
@@ -1263,6 +1290,12 @@ Events.run(EventType.Trigger.draw, () => {
   profNs += Time.nanos() - t0;
 });
 
+try{
+  Events.run(EventType.Trigger.preDraw, () => {
+    if(viewPos != null) Core.camera.position.set(viewCX, viewCY);
+  });
+}catch(err){ Log.err(err); }
+
 // ---------- anti grief ----------
 Events.on(EventType.BlockBuildBeginEvent, e => {
   try{
@@ -1330,7 +1363,7 @@ Events.on(EventType.WorldLoadEvent, e => {
   worldStart = Time.millis();
   if(S.announce) pingDue = Time.millis() + 6000;
   sqClear(); sqTapMode = null;
-  chatSpots = []; lastTopLine = ""; gotoPos = null; lastTexts = {};
+  chatSpots = []; lastTopLine = ""; gotoPos = null; lastTexts = {}; viewBack();
   S.goCore = false;
 });
 
@@ -1404,6 +1437,7 @@ S.coords = Core.settings.getBool("mt-coords", true);
 S.lifo = Core.settings.getBool("mt-lifo", false);
 S.chatSpots = Core.settings.getBool("mt-spots", true);
 S.owner = OWNER_BUILD && Core.settings.getBool("mt-owner", true);
+S.spotFly = Core.settings.getBool("mt-spotfly", false);
 try{
   var sqSaved = JSON.parse(String(Core.settings.getString("mt-squad", "{}")));
   for(var sqk in sqSaved) if(sqk.indexOf("squad") == 0 && sqk != "squadMode") S[sqk] = sqSaved[sqk];
@@ -1515,7 +1549,7 @@ Events.on(EventType.ClientLoadEvent, e => {
       barToggle(holder, "add", "Heal", "heal");
       barToggle(holder, "eye", "Me", "camFollow");
       barToggle(holder, "chartBar", "Stats", "monitor");
-      barButton(holder, "cancel", "Stop", () => { S.assist = false; S.mine = false; S.rebuild = false; S.goCore = false; S.heal = false; gotoPos = null; });
+      barButton(holder, "cancel", "Stop", () => { S.assist = false; S.mine = false; S.rebuild = false; S.goCore = false; S.heal = false; gotoPos = null; viewBack(); });
       barButton(holder, null, "-", () => { S.barMin = true; Core.settings.put("mt-min", true); Core.app.post(mkRun(() => buildBar())); });
       holder.row();
       smallLabel(holder.label(mkProv(() => statusText())).colspan(10).left().width(340).wrap());
@@ -1658,8 +1692,9 @@ Events.on(EventType.ClientLoadEvent, e => {
     spotsDlg.cont.clear();
     spotsDlg.cont.pane(mkCons(p => {
       p.check("Detect coordinates in chat", S.chatSpots, mkBoolc(v => { S.chatSpots = v; Core.settings.put("mt-spots", v); })).left().row();
+      p.check("Fly my unit there instead of moving the camera", S.spotFly, mkBoolc(v => { S.spotFly = v; Core.settings.put("mt-spotfly", v); })).left().wrap().growX().row();
       p.add("[lightgray]Chat list: " + (chatReadOk === null ? "not checked yet" : (chatReadOk ? "readable" : "can't read it")) + "    Player messages seen: " + textsSeen).left().wrap().growX().row();
-      if(gotoPos != null) btn(p, "Stop going there", () => { gotoPos = null; spotsDlg.hide(); });
+      if(gotoPos != null || viewPos != null) btn(p, "Go back (stop looking / flying there)", () => { gotoPos = null; viewBack(); spotsDlg.hide(); });
       if(chatSpots.length == 0) p.add("[lightgray]No coordinates seen in chat yet (like 100,169).").left().wrap().growX().row();
       for(var i = 0; i < chatSpots.length; i++){
         (function(sp){
@@ -1671,7 +1706,7 @@ Events.on(EventType.ClientLoadEvent, e => {
   }
   // the small "chat spots" button on the quick bar
   function spotClick(){
-    if(gotoPos != null){ gotoPos = null; toast("Stopped"); return; }
+    if(gotoPos != null || viewPos != null){ gotoPos = null; viewBack(); toast("Back to normal"); return; }
     if(chatSpots.length > 0 && Time.millis() - chatSpots[0].t < 60000) goToSpot(chatSpots[0]);
     else openSpots();
   }
@@ -1951,6 +1986,7 @@ Events.on(EventType.ClientLoadEvent, e => {
         var sp0 = chatSpots.length > 0 ? chatSpots[0] : null;
         var stxt;
         if(gotoPos != null) stxt = "[accent]going there... tap to stop";
+        else if(viewPos != null) stxt = "[accent]looking there... tap to go back";
         else if(sp0 != null && nowS - sp0.t < 60000) stxt = "[accent]> go to " + sp0.x + "," + sp0.y + "  [lightgray]" + sp0.text.substring(0, 24);
         else stxt = "[lightgray]chat spots" + (chatSpots.length > 0 ? " (" + chatSpots.length + ")" : "");
         if(stxt != lastSpotTxt){ lastSpotTxt = stxt; spotBtn.setText(stxt); }
