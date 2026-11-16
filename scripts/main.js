@@ -5,6 +5,10 @@
 // Only the owner's copy can show the owner badge; the public copy has no way to turn it on.
 var OWNER_BUILD = false;
 
+// Plain names (no colors) that are always shown as the owner, even when the name has no room for a tag.
+// "dark" matches "Dark" and "Dark (Laptop)" but not "Darkness".
+var OWNER_NAMES = ["dark"];
+
 var S = {
   // view
   turretRanges: false, enemyRanges: false, unitRanges: false, power: false,
@@ -21,11 +25,13 @@ var S = {
   // squad (your own units)
   squadMode: "follow", squadForm: "circle", squadSpacing: 3, squadDist: 5, squadRadius: 25, squadShoot: false, squadVia: "game", squadOrbitR: 8, squadOrbitSpeed: 60, squadOrbitDir: 1,
   // misc
-  owner: false, spotFly: false, chatSpots: true, markName: false, announce: true, barMin: false, monitor: false, coords: true, escortDist: 5, escortAngle: 150, tab: 0
+  owner: false, spotFly: false, chatSpots: true, markName: true, announce: false, barMin: false, monitor: false, coords: true, escortDist: 5, escortAngle: 150, tab: 0
 };
 
-var MARK = "\u200b\u200c\u200b";      // optional invisible name tag
-var OWNER_MARK = "\u2060\u200b\u2060";   // added after the ping by the mod owner's copy
+var MARK = "\u200b\u200c";              // invisible name tag: 2 characters = 6 bytes
+var OLD_MARK = "\u200b\u200c\u200b";   // tag from earlier versions (still recognised)
+var OLD_OWNER_MARK = "\u2060\u200b\u2060";
+var OWNER_MARK = "\u2060";               // owner flag: 1 character = 3 bytes
 var PING = "\u200b\u200d\u200c\u200d";   // invisible chat ping that other Mobile Tools users recognise      // invisible tag added to your name so other Mobile Tools users can see you
 var SPEEDS = [1, 1.5, 2, 3];
 var HEAL_AT = [25, 35, 50, 70];
@@ -52,7 +58,7 @@ var statusCache = "", statusAt = 0, powerBad = [], powerAt = 0;
 var fr = 0, sqPhaseT = 0, assistSearchAt = 0, planAt = 0, planSize = -1, planNX = 0, planNY = 0, planKX = 0, planKY = 0, planHave = false;
 var healRP = null, healRPAt = 0, rebuildAt = 0, oreVerAt = 0, rangeAt = 0, rangeList = [], profNs = 0, profFrames = 0, profMs = 0;
 var chatSpots = [], lastTopLine = "", gotoPos = null, spotBtn = null, lastSpotTxt = "", spotAt = 0;
-var viewPos = null, viewCX = 0, viewCY = 0, viewTouch = false, viewTX = 0, viewTY = 0;
+var viewPos = null, viewCX = 0, viewCY = 0, viewTouch = false, viewTX = 0, viewTY = 0, viewVec = new Packages.arc.math.geom.Vec2();
 var lastTexts = {}, textsSeen = 0, chatReadOk = null, pendingTexts = [];
 var respawnPos = null, ownerSeen = {}, modSeen = {}, lastPing = 0, pingDue = 0, detectAt = 0, infoCache = "", infoAt2 = 0, worldStart = Time.millis();
 
@@ -69,9 +75,36 @@ function toast(msg){ Vars.ui.showInfoToast(msg, 3); }
 function me(){ return Vars.player.unit(); }
 function alive(){ return Vars.state.isGame() && !Vars.player.dead(); }
 function sameTeam(p){ return p.team() == Vars.player.team(); }
-function dname(p){ return String(Strings.stripColors(p.name)).split(MARK).join(""); }
+function stripTags(str){ return String(str).split(OLD_OWNER_MARK).join("").split(OLD_MARK).join("").split(OWNER_MARK).join("").split(MARK).join(""); }
+function dname(p){ return stripTags(Strings.stripColors(p.name)); }
+function isOwnerName(p){
+  var n = dname(p).toLowerCase();
+  for(var i = 0; i < OWNER_NAMES.length; i++){
+    var o = OWNER_NAMES[i];
+    if(n == o || n.indexOf(o + " (") == 0 || n.indexOf(o + " [") == 0) return true;
+  }
+  return false;
+}
+function utf8Len(str){
+  var n = 0;
+  for(var i = 0; i < str.length; i++){
+    var c = str.charCodeAt(i);
+    if(c < 0x80) n += 1; else if(c < 0x800) n += 2; else if(c >= 0xD800 && c <= 0xDBFF){ n += 4; i++; } else n += 3;
+  }
+  return n;
+}
+function hiddenCount(name){
+  var t = String(name), n = 0;
+  for(var i = 0; i < t.length; i++){
+    var c = t.charCodeAt(i);
+    if(c == 0x200b || c == 0x200c || c == 0x200d || c == 0x2060 || c == 0xfeff) n++;
+  }
+  return n;
+}
+var nameTag = null; // what applyNameMark did: {ok, base, tag}
+function isOwnerUser(p){ return ownerSeen[p.id] === true || String(p.name).indexOf(OWNER_MARK) >= 0 || isOwnerName(p); }
 function isModUser(p){
-  return modSeen[p.id] === true || String(p.name).indexOf(MARK) >= 0 || ignored[dname(p)] === true;
+  return modSeen[p.id] === true || String(p.name).indexOf(MARK) >= 0 || isOwnerName(p) || ignored[dname(p)] === true;
 }
 function saveMarked(){
   var out = [];
@@ -82,9 +115,13 @@ function saveMarked(){
 function applyNameMark(){
   try{
     var n = String(Core.settings.getString("name", ""));
-    var base = n.split(MARK).join("");
+    var base = stripTags(n);
     if(base.length == 0) return;
-    var want = S.markName ? base + MARK : base;
+    var tag = MARK + ((S.owner && OWNER_BUILD) ? OWNER_MARK : "");
+    var baseBytes = utf8Len(base), tagBytes = utf8Len(tag);
+    var fits = baseBytes + tagBytes <= 40; // the server keeps 40 bytes of a name
+    nameTag = {ok: fits, base: baseBytes, tag: tagBytes};
+    var want = (S.markName && fits) ? base + tag : base;
     if(want != n){
       Core.settings.put("name", want);
       try{ Vars.player.name = want; }catch(err){}
@@ -1082,7 +1119,10 @@ function goToSpot(sp){
   coordMark = {x: viewPos.x, y: viewPos.y, until: Time.millis() + 45000};
   toast("Looking at " + sp.x + "," + sp.y + " (drag the map or tap the button to go back)");
 }
-function viewBack(){ viewPos = null; coordMark = null; viewTouch = false; }
+function viewBack(){
+  viewPos = null; coordMark = null; viewTouch = false;
+  try{ Vars.control.input.panning = false; }catch(err){} // desktop: let the camera follow the unit again
+}
 // glide the camera to the spot; dragging the map hands the camera back
 function viewTick(){
   if(viewPos == null) return;
@@ -1096,7 +1136,9 @@ function viewTick(){
   }else viewTouch = false;
   viewCX += (viewPos.x - viewCX) * 0.3;
   viewCY += (viewPos.y - viewCY) * 0.3;
-  Core.camera.position.set(viewCX, viewCY);
+  viewVec.set(viewCX, viewCY);
+  // the game's own function: moves the camera and stops it snapping back to the unit
+  try{ Vars.control.input.panCamera(viewVec); }catch(err){ Core.camera.position.set(viewCX, viewCY); }
 }
 
 // ---------- brain ----------
@@ -1167,7 +1209,7 @@ Events.run(EventType.Trigger.update, () => {
 
 // ---------- draw hook: runs after the game's own input each frame ----------
 function modDraw(){
-  if(!holdOn && !holdMineOn && shootSrc == null && coordMark == null && gotoPos == null && !(S.squadMode == "orbit" && sqOrder.length > 0) && !(S.turretRanges || S.enemyRanges || S.unitRanges || S.power)) return;
+  if(!holdOn && !holdMineOn && shootSrc == null && coordMark == null && gotoPos == null && viewPos == null && !(S.squadMode == "orbit" && sqOrder.length > 0) && !(S.turretRanges || S.enemyRanges || S.unitRanges || S.power)) return;
   try{
     // while automation is in charge, undo movement/mining resets the normal controls added
     if(holdOn && alive() && me() == holdUnit) holdUnit.vel.set(holdV);
@@ -1176,6 +1218,8 @@ function modDraw(){
       if(hm != null && !holdUnit.within(hm.worldx(), hm.worldy(), holdUnit.type.mineRange + 8)) hm = null;
       holdUnit.mineTile = hm;
     }
+    // on the phone controls the unit chases the camera: while looking at a spot, keep it where it is
+    if(viewPos != null && alive()) me().vel.setZero();
     // copy the helped player's shooting and aim
     if(S.copyShoot && shootSrc != null && alive() && shootSrc.isShooting){
       var mu = me();
@@ -1430,8 +1474,8 @@ function infoText(){
 
 // ---------- UI ----------
 Log.info("Mobile Tools: script loaded");
-S.markName = Core.settings.getBool("mt-mark", false);
-S.announce = Core.settings.getBool("mt-announce", true);
+S.markName = Core.settings.getBool("mt-mark", true);
+S.announce = Core.settings.getBool("mt-announce", false);
 S.barMin = Core.settings.getBool("mt-min", false);
 S.coords = Core.settings.getBool("mt-coords", true);
 S.lifo = Core.settings.getBool("mt-lifo", false);
@@ -1718,7 +1762,7 @@ Events.on(EventType.ClientLoadEvent, e => {
       btn(p, "Anyone who is building", () => { S.targetId = -1; S.assist = true; picker.hide(); refresh(); });
       eachOf(Groups.player, q => {
         if(q == Vars.player || !sameTeam(q)) return;
-        btn(p, dname(q) + (ownerSeen[q.id] === true ? "  [gold](owner)" : (isModUser(q) ? "  [lightgray](Mobile Tools)" : "")), () => { S.targetId = q.id; S.assist = true; picker.hide(); refresh(); });
+        btn(p, dname(q) + (isOwnerUser(q) ? "  [gold](owner)" : (isModUser(q) ? "  [lightgray](Mobile Tools)" : "")), () => { S.targetId = q.id; S.assist = true; picker.hide(); refresh(); });
       });
     })).grow();
     picker.show();
@@ -1920,15 +1964,47 @@ Events.on(EventType.ClientLoadEvent, e => {
 
   function tabUsers(p){
     section(p, "Mobile Tools users", "Found automatically when they use the mod. If it misses someone, tap them to mark them yourself. Marked players are never auto-helped.");
-    p.add("[accent]You:[] " + dname(Vars.player) + (S.owner ? "  [gold](owner of Mobile Tools)" : "")).left().row();
+    p.add("[accent]You:[] " + dname(Vars.player) + ((S.owner || isOwnerName(Vars.player)) ? "  [gold](owner of Mobile Tools)" : "")).left().row();
+    var tagMsg;
+    if(!S.markName) tagMsg = "Name tag is off.";
+    else if(nameTag == null) tagMsg = "Name tag not checked yet.";
+    else if(!nameTag.ok) tagMsg = "[scarlet]Your name is too long for the tag[] (" + nameTag.base + " + " + nameTag.tag + " bytes, a server keeps 40). Shorten it in Settings > Game > Player name.";
+    else tagMsg = "Name tag set (" + nameTag.base + " + " + nameTag.tag + " of 40 bytes). It reaches other players after you rejoin a server.";
+    p.add("[lightgray]" + tagMsg).left().wrap().growX().row();
+    if(S.markName && nameTag != null && !nameTag.ok){
+      // colored names use many bytes; taking the colors out frees room for the tag
+      btn(p, "Make room: remove color codes from my name", () => {
+        var n0 = String(Core.settings.getString("name", ""));
+        var base0 = stripTags(n0);
+        var plain0 = String(Strings.stripColors(base0));
+        if(plain0.length == 0){ toast("Couldn't simplify the name"); return; }
+        if(String(Core.settings.getString("mt-name-backup", "")).length == 0) Core.settings.put("mt-name-backup", base0);
+        Core.settings.put("name", plain0);
+        try{ Vars.player.name = plain0; }catch(err){}
+        applyNameMark();
+        toast("Name simplified. Rejoin a server to apply it.");
+        refresh();
+      });
+    }
+    if(String(Core.settings.getString("mt-name-backup", "")).length > 0){
+      btn(p, "Restore my original name", () => {
+        var bk = String(Core.settings.getString("mt-name-backup", ""));
+        Core.settings.put("name", bk);
+        try{ Vars.player.name = bk; }catch(err){}
+        Core.settings.put("mt-name-backup", "");
+        applyNameMark();
+        toast("Original name restored. Rejoin a server to apply it.");
+        refresh();
+      });
+    }
     var any = false;
     eachOf(Groups.player, q => {
       if(q == Vars.player) return;
       any = true;
       var auto = modSeen[q.id] === true || String(q.name).indexOf(MARK) >= 0;
       var man = ignored[dname(q)] === true;
-      var state = ownerSeen[q.id] === true ? "[gold]Owner of Mobile Tools" : auto ? "[green]Mobile Tools (found automatically)" : (man ? "[accent]marked by you" : "[lightgray]not detected");
-      btn(p, dname(q) + "  " + state, () => {
+      var state = isOwnerUser(q) ? "[gold]Owner of Mobile Tools" : auto ? "[green]Mobile Tools (found automatically)" : (man ? "[accent]marked by you" : "[lightgray]not detected");
+      btn(p, dname(q) + "  " + state + (hiddenCount(q.name) > 0 ? "  [lightgray](" + hiddenCount(q.name) + " hidden chars)" : ""), () => {
         if(auto) return;
         if(man) delete ignored[dname(q)]; else ignored[dname(q)] = true;
         saveMarked();
@@ -1936,10 +2012,10 @@ Events.on(EventType.ClientLoadEvent, e => {
       });
     });
     if(!any) p.add("No other players here").left().row();
-    section(p, "Detection", "Other Mobile Tools users spot you through an invisible chat message sent when you join. Players without the mod may see a blank chat line.");
-    p.check("Announce myself to other Mobile Tools users", S.announce, mkBoolc(v => { S.announce = v; Core.settings.put("mt-announce", v); })).left().wrap().growX().row();
-    if(OWNER_BUILD) p.check("I own this mod (other Mobile Tools users see an owner badge next to my name)", S.owner, mkBoolc(v => { S.owner = v; Core.settings.put("mt-owner", v); pingDue = Time.millis() + 500; refresh(); })).left().wrap().growX().row();
-    p.check("Also tag my name (applies when you rejoin)", S.markName, mkBoolc(v => { S.markName = v; Core.settings.put("mt-mark", v); applyNameMark(); })).left().wrap().growX().row();
+    section(p, "Detection", "Other Mobile Tools users spot you through an invisible tag in your player name. Nothing is sent to chat. The tag applies the next time you join a server.");
+    p.check("Tag my name so other Mobile Tools users can see me (invisible, no chat message)", S.markName, mkBoolc(v => { S.markName = v; Core.settings.put("mt-mark", v); applyNameMark(); })).left().wrap().growX().row();
+    p.check("Also announce myself with an invisible chat message (only if the name tag does not work)", S.announce, mkBoolc(v => { S.announce = v; Core.settings.put("mt-announce", v); })).left().wrap().growX().row();
+    if(OWNER_BUILD) p.check("I own this mod (other Mobile Tools users see an owner badge next to my name)", S.owner, mkBoolc(v => { S.owner = v; Core.settings.put("mt-owner", v); applyNameMark(); pingDue = Time.millis() + 500; refresh(); })).left().wrap().growX().row();
   }
 
   var TABS = [["Help", tabHelp], ["Mine", tabMine], ["Build", tabBuild], ["Unit", tabUnit], ["Guard", tabGuard], ["View", tabView], ["Stats", tabStats], ["Squad", tabSquad], ["Users", tabUsers]];
