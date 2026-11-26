@@ -1,8 +1,8 @@
 {
   "name": "mobile-tools",
   "displayName": "Mobile Tools",
-  "author": "Dark_Matter",
-  "version": "3.2.2",
+  "author": "Dark",
+  "version": "3.2.3",
   "description": "Quick bar + tabbed menu: help builders, build planner, auto mine, auto Heal, speed boost, anti-grief with rebuild, overlays, and user detection.",
   "minGameVersion": 146,
   "hidden": true
