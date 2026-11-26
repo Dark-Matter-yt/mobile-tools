@@ -25,7 +25,7 @@ var S = {
   // squad (your own units)
   squadMode: "follow", squadForm: "circle", squadSpacing: 3, squadDist: 5, squadRadius: 25, squadShoot: false, squadVia: "game", squadOrbitR: 8, squadOrbitSpeed: 60, squadOrbitDir: 1,
   // misc
-  owner: false, spotFly: false, chatSpots: true, markName: true, announce: false, barMin: false, monitor: false, coords: true, escortDist: 5, escortAngle: 150, tab: 0
+  perfMode: "auto", owner: false, helpTrusted: false, spotFly: false, chatSpots: true, markName: true, announce: false, barMin: false, monitor: false, coords: true, escortDist: 5, escortAngle: 150, tab: 0
 };
 
 var MARK = "\u200b\u200c";              // invisible name tag: 2 characters = 6 bytes
@@ -58,6 +58,7 @@ var statusCache = "", statusAt = 0, powerBad = [], powerAt = 0;
 var fr = 0, sqPhaseT = 0, assistSearchAt = 0, planAt = 0, planSize = -1, planNX = 0, planNY = 0, planKX = 0, planKY = 0, planHave = false;
 var healRP = null, healRPAt = 0, rebuildAt = 0, oreVerAt = 0, rangeAt = 0, rangeList = [], profNs = 0, profFrames = 0, profMs = 0;
 var chatSpots = [], lastTopLine = "", gotoPos = null, spotBtn = null, lastSpotTxt = "", spotAt = 0;
+var lite = false, liteSince = 0, fpsOkSince = 0, perfAt = 0, profWorst = 0, profMax = 0, wallJob = null, wallRes = {}, rangeJob = null;
 var viewPos = null, viewCX = 0, viewCY = 0, viewTouch = false, viewTX = 0, viewTY = 0, viewVec = new Packages.arc.math.geom.Vec2();
 var lastTexts = {}, textsSeen = 0, chatReadOk = null, pendingTexts = [];
 var respawnPos = null, ownerSeen = {}, modSeen = {}, lastPing = 0, pingDue = 0, detectAt = 0, infoCache = "", infoAt2 = 0, worldStart = Time.millis();
@@ -106,6 +107,20 @@ function isOwnerUser(p){ return ownerSeen[p.id] === true || String(p.name).index
 function isModUser(p){
   return modSeen[p.id] === true || String(p.name).indexOf(MARK) >= 0 || isOwnerName(p) || ignored[dname(p)] === true;
 }
+// trusted people: kept by plain lowercase name so they survive rejoining
+var trustedNames = {};
+function loadTrusted(){
+  try{
+    var t = String(Core.settings.getString("mt-trusted", "")).split("\n");
+    for(var i = 0; i < t.length; i++) if(t[i].length > 0) trustedNames[t[i]] = true;
+  }catch(err){}
+}
+function saveTrusted(){
+  var out = [];
+  for(var k in trustedNames) if(trustedNames[k] === true) out.push(k);
+  Core.settings.put("mt-trusted", out.join("\n"));
+}
+function isTrusted(p){ return trustedNames[dname(p).toLowerCase()] === true; }
 function saveMarked(){
   var out = [];
   for(var k in ignored) if(ignored[k] === true) out.push(k);
@@ -233,7 +248,7 @@ function assistTick(u, core){
     // keep the previous builder while they keep building (stops flip-flopping between players)
     if(lastTargetId != -1){
       var lp = Groups.player.getByID(lastTargetId);
-      if(lp != null && !lp.dead() && sameTeam(lp) && !(S.skipModUsers && isModUser(lp)) &&
+      if(lp != null && !lp.dead() && sameTeam(lp) && !(S.skipModUsers && isModUser(lp)) && (!S.helpTrusted || isTrusted(lp)) &&
          u.dst(lp.unit()) <= S.helpTiles * 12 && !(ignoreUntil[lp.id] > Time.millis()) &&
          (lp.unit().activelyBuilding() || Time.millis() - lastBuildSeen < 4000)) p = lp;
     }
@@ -243,6 +258,7 @@ function assistTick(u, core){
       eachOf(Groups.player, q => {
         if(q == Vars.player || q.dead() || !sameTeam(q)) return;
         if(S.skipModUsers && isModUser(q)) return; // don't chase other Mobile Tools users
+        if(S.helpTrusted && !isTrusted(q)) return; // only trusted people when that is switched on
         if(ignoreUntil[q.id] > Time.millis()) return;
         var qu = q.unit();
         if(!qu.activelyBuilding()) return;
@@ -481,20 +497,37 @@ function mineResult(u, t){
 }
 function oreOk(t, item){ return t != null && mineResult(me(), t) == item; }
 
-// wall ores (beryllium, tungsten): look around a point
+// wall ores (beryllium, tungsten): looked for a few columns per frame so it never freezes the game.
+// Returns the last finished result; a new scan is started when the old one is stale.
+var WALL_R = 32;
 function scanWallOre(u, item, ox, oy){
-  var cx = Math.floor(ox / 8), cy = Math.floor(oy / 8), R = 32;
-  var best = null, bd = 1e9;
-  for(var x = cx - R; x <= cx + R; x++){
-    for(var y = cy - R; y <= cy + R; y++){
-      var t = Vars.world.tile(x, y);
-      if(t == null || t.block() == Blocks.air) continue;
-      if(mineResult(u, t) != item) continue;
-      var d = (x - cx) * (x - cx) + (y - cy) * (y - cy);
-      if(d < bd){ bd = d; best = t; }
-    }
+  var key = u.type.name + ":" + item.name + ":" + Math.floor(ox / 64) + "," + Math.floor(oy / 64);
+  var now = Time.millis();
+  var r = wallRes[key];
+  if(r != null && now - r.t < 10000) return r.tile;
+  if(wallJob == null){
+    var cx = Math.floor(ox / 8), cy = Math.floor(oy / 8);
+    wallJob = {key: key, u: u, item: item, cx: cx, cy: cy, x: cx - WALL_R, best: null, bd: 1e9};
   }
-  return best;
+  return r != null ? r.tile : null;
+}
+function scanTick(){
+  if(wallJob == null) return;
+  var j = wallJob, budget = lite ? 250 : 600;
+  var u = j.u;
+  if(!u.isValid()){ wallJob = null; return; }
+  while(budget > 0 && j.x <= j.cx + WALL_R){
+    for(var y = j.cy - WALL_R; y <= j.cy + WALL_R; y++){
+      var t = Vars.world.tile(j.x, y);
+      budget--;
+      if(t == null || t.block() == Blocks.air) continue;
+      if(mineResult(u, t) != j.item) continue;
+      var d = (j.x - j.cx) * (j.x - j.cx) + (y - j.cy) * (y - j.cy);
+      if(d < j.bd){ j.bd = d; j.best = t; }
+    }
+    j.x++;
+  }
+  if(j.x > j.cx + WALL_R){ wallRes[j.key] = {t: Time.millis(), tile: j.best}; wallJob = null; }
 }
 
 function findOre(u, item, ox, oy, fromCore){
@@ -503,10 +536,7 @@ function findOre(u, item, ox, oy, fromCore){
     t = fromCore ? Vars.indexer.findClosestOre(ox, oy, item) : Vars.indexer.findClosestOre(u, item);
   }catch(err){}
   if(t != null && mineResult(u, t) == item) return t;
-  if(u.type.mineWalls === true && WALL_ITEMS[item.name] && Time.millis() - lastScan > 4000){
-    lastScan = Time.millis();
-    return scanWallOre(u, item, ox, oy);
-  }
+  if(u.type.mineWalls === true && WALL_ITEMS[item.name]) return scanWallOre(u, item, ox, oy);
   return null;
 }
 
@@ -518,6 +548,7 @@ function hasOreFor(u, item){
   var v = false;
   if(u.type.mineFloor !== false){ try{ v = Vars.indexer.hasOre(item); }catch(err){} }
   if(!v && u.type.mineWalls === true && WALL_ITEMS[item.name]) v = scanWallOre(u, item, u.x, u.y) != null;
+  if(!v && wallJob != null) return v; // a scan is still running: don't remember a not-yet-known answer
   oreCache[key] = {t: now, v: v};
   return v;
 }
@@ -533,6 +564,7 @@ function oreNear(u, item, core){
     var t = findOre(u, item, core.x, core.y, true);
     if(t != null && Mathf.dst(core.x, core.y, t.worldx(), t.worldy()) <= S.mineMaxTiles * 8) v = true;
   }catch(err){}
+  if(!v && wallJob != null) return v;
   nearCache[key] = {t: now, v: v};
   return v;
 }
@@ -704,7 +736,7 @@ function unitSwitchTick(){
 // ---------- finding other Mobile Tools users ----------
 function detectTick(){
   var now = Time.millis();
-  if(now - detectAt < 1000) return;
+  if(now - detectAt < (lite ? 3000 : 1000)) return;
   detectAt = now;
   eachOf(Groups.player, q => {
     if(q == Vars.player) return;
@@ -1141,6 +1173,27 @@ function viewTick(){
   try{ Vars.control.input.panCamera(viewVec); }catch(err){ Core.camera.position.set(viewCX, viewCY); }
 }
 
+// ---------- performance: switch the extras off while the FPS is low ----------
+function perfTick(){
+  var now = Time.millis();
+  if(now - perfAt < 1000) return;
+  perfAt = now;
+  if(S.perfMode == "lite"){ lite = true; return; }
+  if(S.perfMode == "full"){ lite = false; return; }
+  var fps = Core.graphics.getFramesPerSecond();
+  if(!lite){
+    if(fps > 0 && fps < 24){
+      if(liteSince == 0) liteSince = now;
+      if(now - liteSince > 3000){ lite = true; liteSince = 0; fpsOkSince = 0; }
+    }else liteSince = 0;
+  }else{
+    if(fps >= 40){
+      if(fpsOkSince == 0) fpsOkSince = now;
+      if(now - fpsOkSince > 8000){ lite = false; fpsOkSince = 0; }
+    }else fpsOkSince = 0;
+  }
+}
+
 // ---------- brain ----------
 function runBrain(u, core){
   if(!S.assist && assistCopied) dropCopied(u);
@@ -1170,8 +1223,10 @@ function modUpdate(){
     try{ detectTick(); }catch(err){}
     try{ coordTick(); }catch(err){}
     try{ viewTick(); }catch(err){ viewBack(); }
+    try{ scanTick(); }catch(err){ wallJob = null; }
+    try{ perfTick(); }catch(err){}
     ensureBar();
-    if((fr & 3) == 0){
+    if((fr & (lite ? 7 : 3)) == 0){
       try{ squadTick(); }catch(err){ Log.err(err); sqClear(); toast("[scarlet]Squad error, selection cleared"); }
     }
     if(respawnPos != null){
@@ -1202,12 +1257,47 @@ function modUpdate(){
 Events.run(EventType.Trigger.update, () => {
   var t0 = Time.nanos();
   modUpdate();
-  profNs += Time.nanos() - t0;
+  var dt = Time.nanos() - t0;
+  profNs += dt;
+  if(dt > profWorst) profWorst = dt;
   profFrames++;
-  if(profFrames >= 120){ profMs = profNs / profFrames / 1e6; profNs = 0; profFrames = 0; }
+  if(profFrames >= 120){ profMs = profNs / profFrames / 1e6; profMax = profWorst / 1e6; profNs = 0; profWorst = 0; profFrames = 0; }
 });
 
 // ---------- draw hook: runs after the game's own input each frame ----------
+function rangeStep(mine){
+  var now = Time.millis();
+  if(rangeJob == null){
+    if(now - rangeAt < 250) return;
+    rangeAt = now;
+    Core.camera.bounds(Tmp.r1);
+    Tmp.r1.grow(320);
+    var srcs = [];
+    if(S.turretRanges) srcs.push({seq: Vars.indexer.getFlagged(mine, BlockFlag.turret), grp: false});
+    if(S.enemyRanges) srcs.push({seq: Vars.indexer.getEnemy(mine, BlockFlag.turret), grp: false});
+    if(S.unitRanges) srcs.push({seq: Groups.unit, grp: true});
+    rangeJob = {srcs: srcs, si: 0, i: 0, list: [], x0: Tmp.r1.x, y0: Tmp.r1.y, x1: Tmp.r1.x + Tmp.r1.width, y1: Tmp.r1.y + Tmp.r1.height, team: mine};
+  }
+  var j = rangeJob, budget = 150;
+  while(budget > 0 && j.si < j.srcs.length){
+    var src = j.srcs[j.si];
+    var n = src.grp ? src.seq.size() : src.seq.size;
+    if(j.i >= n){ j.si++; j.i = 0; continue; }
+    var b = src.grp ? src.seq.index(j.i) : src.seq.get(j.i);
+    j.i++; budget--;
+    if(b == null) continue;
+    var bx = b.x, by = b.y;
+    if(bx < j.x0 || bx > j.x1 || by < j.y0 || by > j.y1) continue;
+    if(src.grp){
+      if(b.team == j.team) continue;
+      j.list.push({x: 0, y: 0, r: b.range(), c: b.team.color, a: 0.5, u: b});
+    }else{
+      j.list.push({x: bx, y: by, r: b.block.range, c: b.team.color, a: 0.6, u: null});
+    }
+  }
+  if(j.si >= j.srcs.length){ rangeList = j.list; rangeJob = null; }
+}
+
 function modDraw(){
   if(!holdOn && !holdMineOn && shootSrc == null && coordMark == null && gotoPos == null && viewPos == null && !(S.squadMode == "orbit" && sqOrder.length > 0) && !(S.turretRanges || S.enemyRanges || S.unitRanges || S.power)) return;
   try{
@@ -1271,32 +1361,9 @@ function modDraw(){
   try{
     var mine = Vars.player.team();
     var nowD = Time.millis();
-    if(!(S.turretRanges || S.enemyRanges || S.unitRanges)) rangeList = [];
-    else if(nowD - rangeAt > 250){
-      rangeAt = nowD;
-      Core.camera.bounds(Tmp.r1);
-      Tmp.r1.grow(320);
-      var lst = [];
-      if(S.turretRanges){
-        eachOf(Vars.indexer.getFlagged(mine, BlockFlag.turret), b => {
-          if(!Tmp.r1.contains(b.x, b.y)) return;
-          lst.push({x: b.x, y: b.y, r: b.block.range, c: b.team.color, a: 0.6, u: null});
-        });
-      }
-      if(S.enemyRanges){
-        eachOf(Vars.indexer.getEnemy(mine, BlockFlag.turret), b => {
-          if(!Tmp.r1.contains(b.x, b.y)) return;
-          lst.push({x: b.x, y: b.y, r: b.block.range, c: b.team.color, a: 0.6, u: null});
-        });
-      }
-      if(S.unitRanges){
-        eachOf(Groups.unit, un => {
-          if(un.team == mine || !Tmp.r1.contains(un.x, un.y)) return;
-          lst.push({x: 0, y: 0, r: un.range(), c: un.team.color, a: 0.5, u: un});
-        });
-      }
-      rangeList = lst;
-    }
+    if(!(S.turretRanges || S.enemyRanges || S.unitRanges)){ rangeList = []; rangeJob = null; }
+    else if(lite){ rangeList = []; rangeJob = null; }
+    else rangeStep(mine);
     Draw.z(Layer.overlayUI);
     Lines.stroke(1.2);
     for(var ri = 0; ri < rangeList.length; ri++){
@@ -1309,7 +1376,8 @@ function modDraw(){
     }
     if(S.power){
       var now = Time.millis();
-      if(now - powerAt > 600){
+      if(lite) powerBad = [];
+      else if(now - powerAt > 1000){
         powerAt = now;
         var found = [];
         var rad = Math.max(Core.camera.width, Core.camera.height) * 0.7;
@@ -1331,7 +1399,9 @@ function modDraw(){
 Events.run(EventType.Trigger.draw, () => {
   var t0 = Time.nanos();
   modDraw();
-  profNs += Time.nanos() - t0;
+  var dt = Time.nanos() - t0;
+  profNs += dt;
+  if(dt > profWorst) profWorst = dt;
 });
 
 try{
@@ -1345,7 +1415,7 @@ Events.on(EventType.BlockBuildBeginEvent, e => {
   try{
     if(!e.breaking || e.unit == null || !e.unit.isPlayer() || e.team != Vars.player.team()) return;
     var pl = e.unit.getPlayer();
-    if(pl == null || pl == Vars.player) return;
+    if(pl == null || pl == Vars.player || isTrusted(pl)) return;
     var cb = e.tile.build;
     if(cb == null) return;
     var blk = (cb.current != null && cb.current != Blocks.air) ? cb.current : cb.previous;
@@ -1366,7 +1436,7 @@ Events.on(EventType.BlockBuildEndEvent, e => {
     }
     if(!e.breaking || !e.unit.isPlayer() || e.team != Vars.player.team()) return;
     var p = e.unit.getPlayer();
-    if(p == null || p == Vars.player) return;
+    if(p == null || p == Vars.player || isTrusted(p)) return;
     var now = Time.millis();
     if(S.grief){
       var rec = tally[p.id];
@@ -1468,7 +1538,7 @@ function infoText(){
   infoAt2 = now;
   var sec = Math.max(0, Math.floor((now - worldStart) / 1000));
   var mm = Math.floor(sec / 60), ss = sec % 60;
-  infoCache = Core.graphics.getFramesPerSecond() + " fps   " + mm + ":" + (ss < 10 ? "0" : "") + ss + "   mod " + profMs.toFixed(2) + "ms";
+  infoCache = Core.graphics.getFramesPerSecond() + " fps   " + mm + ":" + (ss < 10 ? "0" : "") + ss + "   mod " + profMs.toFixed(2) + "ms (worst " + profMax.toFixed(1) + ")" + (lite ? "   [scarlet]lite[]" : "");
   return infoCache;
 }
 
@@ -1482,6 +1552,8 @@ S.lifo = Core.settings.getBool("mt-lifo", false);
 S.chatSpots = Core.settings.getBool("mt-spots", true);
 S.owner = OWNER_BUILD && Core.settings.getBool("mt-owner", true);
 S.spotFly = Core.settings.getBool("mt-spotfly", false);
+S.helpTrusted = Core.settings.getBool("mt-helptrust", false);
+S.perfMode = String(Core.settings.getString("mt-perf", "auto"));
 try{
   var sqSaved = JSON.parse(String(Core.settings.getString("mt-squad", "{}")));
   for(var sqk in sqSaved) if(sqk.indexOf("squad") == 0 && sqk != "squadMode") S[sqk] = sqSaved[sqk];
@@ -1495,6 +1567,7 @@ try{
   var mk = String(Core.settings.getString("mt-marked", "")).split("\n");
   for(var mi = 0; mi < mk.length; mi++) if(mk[mi].length > 0) ignored[mk[mi]] = true;
 }catch(err){}
+loadTrusted();
 
 Events.on(EventType.ClientLoadEvent, e => {
   try{
@@ -1563,7 +1636,7 @@ Events.on(EventType.ClientLoadEvent, e => {
     if(d != null && TOGI != null){ c = t.button(d, TOGI, run); c.size(38, 38).pad(1); }
     else if(TOGST != null){ c = t.button(label, TOGST, run); c.size(58, 38).pad(1); try{ c.get().getLabel().setFontScale(0.7); }catch(err){} }
     else { c = t.button(label, run); c.size(58, 38).pad(1); }
-    try{ var b = c.get(); b.update(mkRun(() => { b.setChecked(S[key]); })); }catch(err){}
+    try{ var b = c.get(); b.update(mkRun(() => { if((fr % 6) == 0) b.setChecked(S[key]); })); }catch(err){}
     return c;
   }
   function barButton(t, iconName, label, fn){
@@ -1667,30 +1740,50 @@ Events.on(EventType.ClientLoadEvent, e => {
   var rateRef = {}, monAt = 0;
   function fmt(n){ n = Math.floor(n); return n >= 10000 ? (n / 1000).toFixed(1) + "k" : String(n); }
 
-  function powerLine(){
-    var team = Vars.player.team();
-    var seen = {}, stored = 0, cap = 0, prod = 0, need = 0, any = false;
-    function addG(b){
+  // power numbers are gathered a few buildings per frame, so a big base never causes a hitch
+  var pw = {seqs: null, si: 0, i: 0, seen: {}, stored: 0, cap: 0, prod: 0, need: 0, any: false, doneAt: 0, text: "[lightgray]Power: reading..."};
+  function powerStep(budget){
+    var now = Time.millis();
+    if(pw.seqs == null){
+      if(pw.doneAt != 0 && now - pw.doneAt < 2000) return true;
+      var team = Vars.player.team();
+      pw.seqs = [];
+      try{ pw.seqs.push(Vars.indexer.getFlagged(team, BlockFlag.battery)); }catch(err){}
+      try{ pw.seqs.push(Vars.indexer.getFlagged(team, BlockFlag.generator)); }catch(err){}
+      pw.si = 0; pw.i = 0; pw.seen = {}; pw.stored = 0; pw.cap = 0; pw.prod = 0; pw.need = 0; pw.any = false;
+    }
+    while(budget > 0 && pw.si < pw.seqs.length){
+      var sq = pw.seqs[pw.si];
+      if(pw.i >= sq.size){ pw.si++; pw.i = 0; continue; }
+      var b = sq.get(pw.i);
+      pw.i++; budget--;
       try{
-        if(b.power == null || b.power.graph == null) return;
+        if(b == null || b.power == null || b.power.graph == null) continue;
         var g = b.power.graph;
         var key = String(g.hashCode());
-        if(seen[key]) return;
-        seen[key] = true;
-        any = true;
-        stored += g.getBatteryStored();
-        cap += g.getTotalBatteryCapacity();
-        prod += g.getLastPowerProduced() * 60;
-        need += g.getLastPowerNeeded() * 60;
+        if(pw.seen[key]) continue;
+        pw.seen[key] = true;
+        pw.any = true;
+        pw.stored += g.getBatteryStored();
+        pw.cap += g.getTotalBatteryCapacity();
+        pw.prod += g.getLastPowerProduced() * 60;
+        pw.need += g.getLastPowerNeeded() * 60;
       }catch(err){}
     }
-    try{ eachOf(Vars.indexer.getFlagged(team, BlockFlag.battery), addG); }catch(err){}
-    try{ eachOf(Vars.indexer.getFlagged(team, BlockFlag.generator), addG); }catch(err){}
-    if(!any) return "[lightgray]Power: none";
-    var net = prod - need;
-    return "Power " + (net >= 0 ? "[green]+" : "[scarlet]") + fmt(net) + "[lightgray]/s[]  made " + fmt(prod) + "  used " + fmt(need) +
-           (cap > 0 ? "\nBattery " + fmt(stored) + "/" + fmt(cap) + " [lightgray](" + Math.round(stored / cap * 100) + "%)[]" : "");
+    if(pw.si >= pw.seqs.length){
+      if(!pw.any) pw.text = "[lightgray]Power: none";
+      else{
+        var net = pw.prod - pw.need;
+        pw.text = "Power " + (net >= 0 ? "[green]+" : "[scarlet]") + fmt(net) + "[lightgray]/s[]  made " + fmt(pw.prod) + "  used " + fmt(pw.need) +
+                  (pw.cap > 0 ? "\nBattery " + fmt(pw.stored) + "/" + fmt(pw.cap) + " [lightgray](" + Math.round(pw.stored / pw.cap * 100) + "%)[]" : "");
+      }
+      pw.doneAt = now;
+      pw.seqs = null;
+      return true;
+    }
+    return false;
   }
+  function powerLine(){ return pw.text; }
 
   // current numbers for the monitor (used by the floating panel and by the Stats tab)
   function monData(){
@@ -1762,7 +1855,7 @@ Events.on(EventType.ClientLoadEvent, e => {
       btn(p, "Anyone who is building", () => { S.targetId = -1; S.assist = true; picker.hide(); refresh(); });
       eachOf(Groups.player, q => {
         if(q == Vars.player || !sameTeam(q)) return;
-        btn(p, dname(q) + (isOwnerUser(q) ? "  [gold](owner)" : (isModUser(q) ? "  [lightgray](Mobile Tools)" : "")), () => { S.targetId = q.id; S.assist = true; picker.hide(); refresh(); });
+        btn(p, dname(q) + (isOwnerUser(q) ? "  [gold](owner)" : (isModUser(q) ? "  [lightgray](Mobile Tools)" : "")) + (isTrusted(q) ? "  [gold]trusted[]" : ""), () => { S.targetId = q.id; S.assist = true; picker.hide(); refresh(); });
       });
     })).grow();
     picker.show();
@@ -1820,6 +1913,7 @@ Events.on(EventType.ClientLoadEvent, e => {
     toggle(p, "Shoot where they shoot", "copyShoot");
     toggle(p, "Respawn at the core nearest them if they are very far", "farReset");
     toggle(p, "Don't help other Mobile Tools users (when helping anyone)", "skipModUsers");
+    p.check("When helping anyone: only help trusted people (set them in the Users tab)", S.helpTrusted, mkBoolc(v => { S.helpTrusted = v; Core.settings.put("mt-helptrust", v); })).left().wrap().growX().row();
   }
 
   function tabMine(p){
@@ -1866,6 +1960,7 @@ Events.on(EventType.ClientLoadEvent, e => {
 
   function tabStats(p){
     section(p, "Core items", "Net change per second over the last few seconds. FULL means the core is at capacity.");
+    powerStep(100000);
     var d = monData();
     p.table(mkCons(t => {
       t.add(String(d.l)).left().top().padRight(24);
@@ -1957,6 +2052,13 @@ Events.on(EventType.ClientLoadEvent, e => {
     toggle(p, "Enemy turret ranges", "enemyRanges");
     toggle(p, "Enemy unit ranges", "unitRanges");
     toggle(p, "Mark underpowered blocks", "power");
+    section(p, "Performance", "Auto turns the extras (overlays, monitor) off while your FPS is low and back on when it recovers. The numbers under the bar show what the mod costs: average and worst frame in milliseconds.");
+    btn(p, "Performance: " + (S.perfMode == "auto" ? "auto" : (S.perfMode == "lite" ? "always lite (extras off)" : "always full")) + " (tap to change)", () => {
+      S.perfMode = S.perfMode == "auto" ? "lite" : (S.perfMode == "lite" ? "full" : "auto");
+      Core.settings.put("mt-perf", S.perfMode);
+      perfAt = 0;
+      refresh();
+    });
     section(p, "Monitors", "Shown under the quick bar (drag the bar to move it): every item in your core, how fast it changes, FULL warnings and power/battery.");
     p.check("Resource monitor (under the quick bar)", S.monitor, mkBoolc(v => { S.monitor = v; Core.settings.put("mt-mon", v); })).left().row();
     p.check("Show coordinates when I tap the map", S.coords, mkBoolc(v => { S.coords = v; Core.settings.put("mt-coords", v); })).left().row();
@@ -2004,14 +2106,40 @@ Events.on(EventType.ClientLoadEvent, e => {
       var auto = modSeen[q.id] === true || String(q.name).indexOf(MARK) >= 0;
       var man = ignored[dname(q)] === true;
       var state = isOwnerUser(q) ? "[gold]Owner of Mobile Tools" : auto ? "[green]Mobile Tools (found automatically)" : (man ? "[accent]marked by you" : "[lightgray]not detected");
-      btn(p, dname(q) + "  " + state + (hiddenCount(q.name) > 0 ? "  [lightgray](" + hiddenCount(q.name) + " hidden chars)" : ""), () => {
-        if(auto) return;
-        if(man) delete ignored[dname(q)]; else ignored[dname(q)] = true;
-        saveMarked();
-        refresh();
-      });
+      var nm = dname(q), tkey = nm.toLowerCase(), isTr = trustedNames[tkey] === true;
+      var label = nm + "  " + state + (isTr ? "  [gold]trusted[]" : "") + (hiddenCount(q.name) > 0 ? "  [lightgray](" + hiddenCount(q.name) + " hidden chars)" : "");
+      p.table(mkCons(t => {
+        t.button(label, mkRun(() => {
+          if(auto) return;
+          if(man) delete ignored[nm]; else ignored[nm] = true;
+          saveMarked();
+          refresh();
+        })).growX().height(46).pad(2);
+        t.button(isTr ? "[gold]trusted" : "trust", mkRun(() => {
+          if(isTr) delete trustedNames[tkey]; else trustedNames[tkey] = true;
+          saveTrusted();
+          refresh();
+        })).width(110).height(46).pad(2);
+      })).growX().row();
     });
     if(!any) p.add("No other players here").left().row();
+    section(p, "Trusted people", "Trusted players are never flagged by anti-grief, and Help can be limited to them. Tap trust next to a player above, or add a name here (it also works for people who are offline).");
+    var tn = [];
+    for(var tk in trustedNames) if(trustedNames[tk] === true) tn.push(tk);
+    if(tn.length == 0) p.add("[lightgray]nobody yet").left().row();
+    for(var ti = 0; ti < tn.length; ti++){
+      (function(key){
+        btn(p, "[gold]" + key + "[]   (tap to remove)", () => { delete trustedNames[key]; saveTrusted(); refresh(); });
+      })(tn[ti]);
+    }
+    btn(p, "Add a name...", () => {
+      try{
+        Vars.ui.showTextInput("Add trusted person", "Player name (colors don't matter)", 40, "", mkCons(v => {
+          var k = stripTags(Strings.stripColors(String(v))).trim().toLowerCase();
+          if(k.length > 0){ trustedNames[k] = true; saveTrusted(); refresh(); }
+        }));
+      }catch(err){ toast("Couldn't open the text box"); }
+    });
     section(p, "Detection", "Other Mobile Tools users spot you through an invisible tag in your player name. Nothing is sent to chat. The tag applies the next time you join a server.");
     p.check("Tag my name so other Mobile Tools users can see me (invisible, no chat message)", S.markName, mkBoolc(v => { S.markName = v; Core.settings.put("mt-mark", v); applyNameMark(); })).left().wrap().growX().row();
     p.check("Also announce myself with an invisible chat message (only if the name tag does not work)", S.announce, mkBoolc(v => { S.announce = v; Core.settings.put("mt-announce", v); })).left().wrap().growX().row();
@@ -2054,7 +2182,7 @@ Events.on(EventType.ClientLoadEvent, e => {
   holder.update(mkRun(() => {
     holder.visible = Vars.state.isGame();
     if(S.monitor != lastMon){ lastMon = S.monitor; Core.app.post(mkRun(() => buildBar())); }
-    if(S.monitor && holder.visible) updateMon();
+    if(S.monitor && holder.visible && !lite){ powerStep(60); updateMon(); }
     if(spotBtn != null){
       var nowS = Time.millis();
       if(nowS - spotAt > 250){
